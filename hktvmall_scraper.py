@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-HKTVmall product scraper – Streamlit web app.
-Unlimited pagination via automatic task splitting (category / price / brand).
+HKTVmall 商品爬蟲 – Streamlit 網頁版
+支援關鍵字 / 分類 / 混合 / 全站掃描，自動分割任務突破 API 分頁上限。
 """
 
 from __future__ import annotations
@@ -12,20 +13,27 @@ import json
 import os
 import re
 import time
+import zipfile
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import quote
 
 import pandas as pd
 import requests
 import streamlit as st
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
+from PIL import Image as PILImage
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 常數
+# =============================================================================
 
 APP_VERSION = "1.4-webapp-unlimited"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
@@ -45,15 +53,84 @@ DEFAULT_PRICE_RANGE_BUCKETS = [
 ]
 MAX_SPLIT_DEPTH = 6
 MAX_SUBCATEGORY_DEPTH = 4
-MAX_BRAND_SPLITS = 20
+MAX_BRAND_SPLITS = 30
+
 CHECKPOINT_DIR = "hktv_checkpoints"
 BACKUP_DIR = "hktv_backups"
+EXPORT_DIR = "hktv_exports"
+IMAGE_CACHE_DIR = "hktv_image_cache"
 
-PRODUCT_URL_BASE = "https://www.hktvmall.com/hktv/zh/main/p/"
+WEBSITES: dict[str, dict[str, str]] = {
+    "hktv_zh": {
+        "label": "HKTVmall 繁體",
+        "lang": "zh",
+        "product_url_base": "https://www.hktvmall.com/hktv/zh/main/p/",
+        "search_url_base": "https://www.hktvmall.com/hktv/zh/main/search",
+        "pdp_url_base": "https://www.hktvmall.com/hktv/zh/main/p/",
+    },
+    "hktv_en": {
+        "label": "HKTVmall English",
+        "lang": "en",
+        "product_url_base": "https://www.hktvmall.com/hktv/en/main/p/",
+        "search_url_base": "https://www.hktvmall.com/hktv/en/main/search",
+        "pdp_url_base": "https://www.hktvmall.com/hktv/en/main/p/",
+    },
+}
 
-# ---------------------------------------------------------------------------
-# Generic helpers (unchanged utilities)
-# ---------------------------------------------------------------------------
+EXCEL_COLUMNS: list[str] = [
+    "product_code",
+    "base_product",
+    "name",
+    "brand",
+    "selling_price",
+    "selling_price_range",
+    "saved_price",
+    "average_rating",
+    "number_of_reviews",
+    "in_stock",
+    "stock",
+    "loyalty_point",
+    "number_of_variants",
+    "main_category",
+    "sub_category",
+    "category_path",
+    "primary_cat_code",
+    "store",
+    "store_code",
+    "country_of_origin",
+    "packing_spec",
+    "summary",
+    "image",
+    "image_local",
+    "product_url",
+    "keyword",
+    "task_categories",
+    "price_range_filter",
+    "brand_filter",
+    "source_mode",
+    "source_query",
+    "scraped_at",
+]
+
+SORT_OPTIONS: dict[str, tuple[str, bool] | None] = {
+    "預設（抓取順序）": None,
+    "商品編號 A→Z": ("product_code", True),
+    "商品編號 Z→A": ("product_code", False),
+    "價格 低→高": ("selling_price", True),
+    "價格 高→低": ("selling_price", False),
+    "評分 低→高": ("average_rating", True),
+    "評分 高→低": ("average_rating", False),
+    "評論數 少→多": ("number_of_reviews", True),
+    "評論數 多→少": ("number_of_reviews", False),
+    "品牌 A→Z": ("brand", True),
+    "名稱 A→Z": ("name", True),
+}
+
+SKIP_BRAND_FACETS = frozenset({"OtherBrands", "ShippedfromMainland"})
+
+# =============================================================================
+# 通用工具
+# =============================================================================
 
 
 def clean(value: Any) -> str:
@@ -88,7 +165,7 @@ def unique(seq: list[Any]) -> list[Any]:
     return out
 
 
-def display_fragments(parts: list[str]) -> str:
+def display_fragments(parts: list[Any]) -> str:
     return " / ".join(clean(p) for p in parts if clean(p))
 
 
@@ -100,58 +177,9 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def make_http_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        connect=3,
-        read=3,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET", "POST"),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    session.headers.update(
-        {
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; HKTVmallScraper/1.4)",
-            "Authorization": f"ApiKey {HKTV_API_KEY}",
-        }
-    )
-    return session
-
-
-def get_http_session() -> requests.Session:
-    if st.session_state.http_session is None:
-        st.session_state.http_session = make_http_session()
-    return st.session_state.http_session
-
-
-def close_http_session() -> None:
-    session = st.session_state.get("http_session")
-    if session is not None:
-        try:
-            session.close()
-        except Exception:
-            pass
-    st.session_state.http_session = None
-
-
-def api_max_page_number(page_size: int) -> int:
-    if page_size <= 0:
-        return 0
-    return max(0, (API_MAX_OFFSET // page_size) - 1)
-
-
-def is_top_level_category_code(code: str) -> bool:
-    if not code:
-        return False
-    if not code.startswith("AA"):
-        return True
-    return len(code) == 14 and code.endswith("0000000")
+def safe_filename(name: str, max_len: int = 80) -> str:
+    text = re.sub(r"[^\w\-.]+", "_", clean(name), flags=re.UNICODE)
+    return (text or "item")[:max_len]
 
 
 def merge_filters(base: dict | None, extra: dict | None) -> dict:
@@ -171,19 +199,94 @@ def merge_filters(base: dict | None, extra: dict | None) -> dict:
     return merged
 
 
-def build_filter_from_task(task: dict) -> dict:
-    filt: dict[str, Any] = {}
-    categories = task.get("categories") or []
-    if categories:
-        filt["category"] = list(categories)
+def is_top_level_category_code(code: str) -> bool:
+    if not code:
+        return False
+    if not code.startswith("AA"):
+        return True
+    return len(code) == 14 and code.endswith("0000000")
+
+
+def append_activity(message: str, level: str = "info") -> None:
+    init_state()
+    entry = {"time": now_iso(), "level": level, "message": message}
+    st.session_state.activity_log.append(entry)
+    st.session_state.activity_log = st.session_state.activity_log[-500:]
+    st.session_state.last_message = message
+
+
+def website_cfg(site_key: str | None = None) -> dict[str, str]:
+    key = site_key or st.session_state.get("website_key", "hktv_zh")
+    return WEBSITES.get(key, WEBSITES["hktv_zh"])
+
+
+# =============================================================================
+# HTTP Session
+# =============================================================================
+
+
+def build_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "POST"),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(
+        {
+            "accept": "application/json, text/html, */*",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; HKTVmallScraper/1.4)",
+            "Authorization": f"ApiKey {HKTV_API_KEY}",
+        }
+    )
+    return session
+
+
+def get_session() -> requests.Session:
+    init_state()
+    if st.session_state.http_session is None:
+        st.session_state.http_session = build_session()
+    return st.session_state.http_session
+
+
+def close_session() -> None:
+    session = st.session_state.get("http_session")
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
+    st.session_state.http_session = None
+
+
+# =============================================================================
+# 分頁 / 任務輔助（v1.4 新增）
+# =============================================================================
+
+
+def api_max_page_number(page_size: int) -> int:
+    if page_size <= 0:
+        return 0
+    return max(0, (API_MAX_OFFSET // page_size) - 1)
+
+
+def build_task_extra_filter(task: dict) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
     if task.get("price_range"):
-        filt["priceRange"] = [task["price_range"]]
+        extra["priceRange"] = [task["price_range"]]
     if task.get("brand"):
-        filt["brand"] = [task["brand"]]
-    return filt
+        extra["brand"] = [task["brand"]]
+    return extra
 
 
-def page_signature(
+def task_page_signature(
     task_idx: int,
     page_number: int,
     categories: list[str],
@@ -206,9 +309,48 @@ def page_signature(
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# API layer
-# ---------------------------------------------------------------------------
+def insert_split_tasks(tasks: list[dict], task_idx: int, sub_tasks: list[dict]) -> None:
+    if not sub_tasks:
+        return
+    tasks[task_idx + 1 : task_idx + 1] = sub_tasks
+
+
+def fetch_brand_facets(
+    session: requests.Session,
+    *,
+    keyword: str = "",
+    categories: list[str] | None = None,
+    extra_filter: dict | None = None,
+    limit: int = MAX_BRAND_SPLITS,
+    timeout: float = 30.0,
+) -> list[str]:
+    filter_obj: dict[str, Any] = {}
+    if categories:
+        filter_obj["category"] = list(categories)
+    result = hktv_search_request(
+        session,
+        keyword=keyword,
+        page_number=0,
+        page_size=1,
+        filter_obj=filter_obj,
+        aggregations=["brand"],
+        extra_filter=extra_filter,
+        timeout=timeout,
+    )
+    brand_agg = result.get("aggregations", {}).get("brand") or {}
+    if not isinstance(brand_agg, dict):
+        return []
+    brands = [
+        b
+        for b, _ in sorted(brand_agg.items(), key=lambda kv: kv[1], reverse=True)
+        if b and b not in SKIP_BRAND_FACETS
+    ]
+    return brands[:limit]
+
+
+# =============================================================================
+# API 層
+# =============================================================================
 
 
 def hktv_search_request(
@@ -222,10 +364,7 @@ def hktv_search_request(
     extra_filter: dict | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any]:
-    """POST to HKTVmall keyword search API and return the first result block."""
     merged_filter = merge_filters(filter_obj, extra_filter)
-
-    # priceRange in filter is converted to the API range field
     price_ranges = merged_filter.pop("priceRange", None)
     range_obj: dict[str, str] = {}
     if price_ranges:
@@ -243,11 +382,7 @@ def hktv_search_request(
     if range_obj:
         request_body["range"] = range_obj
 
-    response = session.post(
-        HKTV_SEARCH_URL,
-        json={"requests": [request_body]},
-        timeout=timeout,
-    )
+    response = session.post(HKTV_SEARCH_URL, json={"requests": [request_body]}, timeout=timeout)
     response.raise_for_status()
     payload = response.json()
     if payload.get("code") != 200:
@@ -293,7 +428,7 @@ def hktv_fetch_page(
 def fetch_top_level_categories(
     session: requests.Session,
     timeout: float = 30.0,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     result = hktv_search_request(
         session,
         keyword="",
@@ -306,7 +441,7 @@ def fetch_top_level_categories(
     agg = result.get("aggregations", {}).get("category") or {}
     if not isinstance(agg, dict):
         return []
-    items: list[dict[str, str]] = []
+    items: list[dict[str, Any]] = []
     for code, count in sorted(agg.items(), key=lambda kv: kv[1], reverse=True):
         if not is_top_level_category_code(code):
             continue
@@ -322,7 +457,6 @@ def discover_child_category_codes(
     keyword: str = "",
     extra_filter: dict | None = None,
 ) -> list[dict[str, str]]:
-    """Discover child category codes under parent_code from product hits and samples."""
     discovered: dict[str, str] = {}
 
     def collect_from_hits(hits: list[dict]) -> None:
@@ -332,8 +466,8 @@ def discover_child_category_codes(
             if not code or code == parent_code:
                 continue
             cat_display = src.get("categoryStructureDisplay")
-            if isinstance(cat_display, list):
-                name = clean(cat_display[-1]) if cat_display else code
+            if isinstance(cat_display, list) and cat_display:
+                name = clean(cat_display[-1])
             else:
                 name = first(
                     src.get("catNameZh"),
@@ -356,14 +490,14 @@ def discover_child_category_codes(
     )
     collect_from_hits(first_page.get("hits") or [])
 
-    brand_agg = first_page.get("aggregations", {}).get("brand") or {}
-    top_brands = []
-    if isinstance(brand_agg, dict):
-        top_brands = [
-            b
-            for b, _ in sorted(brand_agg.items(), key=lambda kv: kv[1], reverse=True)
-            if b and b not in ("OtherBrands", "ShippedfromMainland")
-        ][:8]
+    top_brands = fetch_brand_facets(
+        session,
+        keyword=keyword,
+        categories=[parent_code],
+        extra_filter=extra_filter,
+        limit=8,
+        timeout=timeout,
+    )
 
     for bucket in DEFAULT_PRICE_RANGE_BUCKETS:
         bucket_filter = merge_filters(base_filter, {"priceRange": [bucket]})
@@ -373,7 +507,7 @@ def discover_child_category_codes(
             page_number=0,
             page_size=DEFAULT_PAGE_SIZE,
             filter_obj=bucket_filter,
-            aggregations=["category"],
+            aggregations=["category", "brand"],
             timeout=timeout,
         )
         collect_from_hits(sampled.get("hits") or [])
@@ -386,16 +520,12 @@ def discover_child_category_codes(
             page_number=0,
             page_size=DEFAULT_PAGE_SIZE,
             filter_obj=brand_filter,
-            aggregations=["category"],
+            aggregations=["category", "brand"],
             timeout=timeout,
         )
         collect_from_hits(sampled.get("hits") or [])
 
-    children: list[dict[str, str]] = []
-    for code, name in discovered.items():
-        if code == parent_code:
-            continue
-        children.append({"code": code, "name": name})
+    children = [{"code": code, "name": name} for code, name in discovered.items() if code != parent_code]
     children.sort(key=lambda item: item["code"])
     return children
 
@@ -404,18 +534,122 @@ def fetch_subcategories_for_code(
     session: requests.Session,
     parent_code: str,
     timeout: float = 30.0,
+    *,
+    keyword: str = "",
+    extra_filter: dict | None = None,
 ) -> list[dict[str, str]]:
-    """Compatibility wrapper – aggregations.category is {code: count}, not facets."""
-    return discover_child_category_codes(session, parent_code, timeout)
+    return discover_child_category_codes(
+        session,
+        parent_code,
+        timeout,
+        keyword=keyword,
+        extra_filter=extra_filter,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Product parsing & export
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 商品解析
+# =============================================================================
 
 
-def hit_to_row(hit: dict, *, task: dict) -> dict[str, Any]:
+def hktv_pdp_fallback_fields(
+    session: requests.Session,
+    product_code: str,
+    site_key: str = "hktv_zh",
+    timeout: float = 20.0,
+) -> dict[str, Any]:
+    """從商品詳情頁補充搜尋 API 缺少的欄位。"""
+    if not product_code:
+        return {}
+    cfg = WEBSITES.get(site_key, WEBSITES["hktv_zh"])
+    url = cfg["pdp_url_base"] + quote(product_code, safe="")
+    try:
+        response = session.get(url, timeout=timeout, headers={"accept": "text/html"})
+        response.raise_for_status()
+        html = response.text
+    except Exception:
+        return {}
+
+    fields: dict[str, Any] = {}
+    match = re.search(r"var\s+productData\s*=\s*(\{.*?\});\s*\n", html, re.S)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            fields.update(
+                {
+                    "name": first(data.get("name"), data.get("nameZh")),
+                    "brand": first(data.get("brandName"), data.get("brand")),
+                    "selling_price": first(
+                        (data.get("price") or {}).get("value"),
+                        data.get("sellingPrice"),
+                    ),
+                    "saved_price": first(
+                        (data.get("price") or {}).get("saved"),
+                        data.get("savedPrice"),
+                    ),
+                    "average_rating": data.get("averageRating"),
+                    "number_of_reviews": data.get("numberOfReviews"),
+                    "stock": data.get("stock"),
+                    "in_stock": data.get("purchasable"),
+                    "summary": first(data.get("summary"), data.get("description")),
+                    "packing_spec": data.get("packingSpec"),
+                    "store": first(data.get("storeName"), data.get("storeDisplay")),
+                    "store_code": data.get("storeCode"),
+                    "country_of_origin": data.get("countryOfOrigin"),
+                    "image": first(
+                        (data.get("images") or [None])[0] if isinstance(data.get("images"), list) else None,
+                        data.get("imageLink"),
+                    ),
+                    "product_url": first(data.get("url"), url),
+                }
+            )
+            categories = data.get("categories") or []
+            if categories:
+                names = [clean(c.get("name")) for c in categories if isinstance(c, dict)]
+                fields["category_path"] = display_fragments(names)
+                if names:
+                    fields["main_category"] = names[0]
+                    if len(names) > 1:
+                        fields["sub_category"] = names[1]
+        except json.JSONDecodeError:
+            pass
+
+    if not fields.get("name"):
+        for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.S):
+            try:
+                ld = json.loads(block)
+            except json.JSONDecodeError:
+                continue
+            if ld.get("@type") != "Product":
+                continue
+            fields.setdefault("name", ld.get("name"))
+            brand = ld.get("brand")
+            if isinstance(brand, dict):
+                fields.setdefault("brand", brand.get("name"))
+            offers = ld.get("offers") or {}
+            if isinstance(offers, dict):
+                fields.setdefault("selling_price", offers.get("price"))
+            rating = ld.get("aggregateRating") or {}
+            if isinstance(rating, dict):
+                fields.setdefault("average_rating", rating.get("ratingValue"))
+                fields.setdefault("number_of_reviews", rating.get("reviewCount"))
+            images = ld.get("image")
+            if images and not fields.get("image"):
+                fields["image"] = images[0] if isinstance(images, list) else images
+            break
+    return {k: v for k, v in fields.items() if v not in (None, "", [])}
+
+
+def parse_hktv_hit(
+    hit: dict,
+    *,
+    task: dict,
+    site_key: str = "hktv_zh",
+    session: requests.Session | None = None,
+    use_pdp_fallback: bool = False,
+) -> dict[str, Any]:
     src = hit.get("source") or hit
+    cfg = WEBSITES.get(site_key, WEBSITES["hktv_zh"])
     code = clean(src.get("code") or src.get("productSearchCode"))
     name = first(src.get("nameZh"), src.get("nameEn"), src.get("nameZhCN"))
     brand = first(src.get("brandDisplay"), src.get("brandZh"), src.get("brand"), src.get("brandEn"))
@@ -435,9 +669,9 @@ def hit_to_row(hit: dict, *, task: dict) -> dict[str, Any]:
     )
     product_url = first(src.get("urlZh"), src.get("urlEn"))
     if not product_url and code:
-        product_url = PRODUCT_URL_BASE + code
+        product_url = cfg["product_url_base"] + code
 
-    return {
+    row: dict[str, Any] = {
         "product_code": code,
         "base_product": clean(src.get("baseProduct")),
         "name": clean(name),
@@ -455,37 +689,206 @@ def hit_to_row(hit: dict, *, task: dict) -> dict[str, Any]:
         "sub_category": clean(first(src.get("subCat1NameZh"), src.get("subCat1NameEn"))),
         "category_path": category_path,
         "primary_cat_code": clean(src.get("primaryCatCode")),
-        "image": clean(image),
-        "product_url": clean(product_url),
         "store": clean(first(src.get("storeNameZh"), src.get("storeDisplay"), src.get("store"))),
+        "store_code": clean(src.get("storeCode")),
+        "country_of_origin": clean(
+            first(src.get("countryOfOriginDisplay"), src.get("countryOfOriginZh"), src.get("countryOfOrigin"))
+        ),
+        "packing_spec": clean(first(src.get("packingSpecZh"), src.get("packingSpecEn"))),
+        "summary": clean(first(src.get("summaryZh"), src.get("summaryEn"))),
+        "image": clean(image),
+        "image_local": "",
+        "product_url": clean(product_url),
         "keyword": clean(task.get("keyword")),
         "task_categories": ",".join(task.get("categories") or []),
         "price_range_filter": clean(task.get("price_range")),
         "brand_filter": clean(task.get("brand")),
-        "source_mode": clean(task.get("mode")),
+        "source_mode": clean(task.get("mode") or task.get("method")),
+        "source_query": clean(task.get("keyword") or ",".join(task.get("categories") or [])),
         "scraped_at": now_iso(),
     }
+
+    if use_pdp_fallback and session and code:
+        missing = [
+            k
+            for k in ("name", "brand", "selling_price", "average_rating", "summary", "image")
+            if not row.get(k)
+        ]
+        if missing:
+            fallback = hktv_pdp_fallback_fields(session, code, site_key=site_key)
+            for key, value in fallback.items():
+                if not row.get(key):
+                    row[key] = value
+    return row
+
+
+# =============================================================================
+# 匯出（含圖片）
+# =============================================================================
+
+
+def download_image_bytes(session: requests.Session, url: str, timeout: float = 20.0) -> bytes | None:
+    if not url:
+        return None
+    try:
+        resp = session.get(url, timeout=timeout, headers={"accept": "image/*"})
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
+
+def cache_product_image(session: requests.Session, row: dict, timeout: float = 20.0) -> str:
+    code = clean(row.get("product_code"))
+    image_url = clean(row.get("image"))
+    if not code or not image_url:
+        return ""
+    ensure_dir(IMAGE_CACHE_DIR)
+    ext = os.path.splitext(image_url.split("?")[0])[1] or ".jpg"
+    local_path = os.path.join(IMAGE_CACHE_DIR, safe_filename(code) + ext)
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+    data = download_image_bytes(session, image_url, timeout=timeout)
+    if not data:
+        return ""
+    with open(local_path, "wb") as fh:
+        fh.write(data)
+    return local_path
 
 
 def rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
     if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+        return pd.DataFrame(columns=EXCEL_COLUMNS)
+    df = pd.DataFrame(rows)
+    for col in EXCEL_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[EXCEL_COLUMNS]
 
 
-def autosize_excel_columns(writer: pd.ExcelWriter, sheet_name: str, df: pd.DataFrame) -> None:
-    worksheet = writer.sheets[sheet_name]
-    for idx, col in enumerate(df.columns, start=1):
-        max_len = max([len(str(col))] + [len(str(v)) for v in df[col].head(200).tolist()])
-        worksheet.column_dimensions[get_column_letter(idx)].width = min(max_len + 2, 60)
+def sort_dataframe(df: pd.DataFrame, sort_key: str) -> pd.DataFrame:
+    spec = SORT_OPTIONS.get(sort_key)
+    if not spec or df.empty:
+        return df
+    col, ascending = spec
+    if col not in df.columns:
+        return df
+    work = df.copy()
+    if col in {"selling_price", "average_rating", "number_of_reviews"}:
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    return work.sort_values(by=col, ascending=ascending, kind="mergesort", na_position="last")
 
 
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+def build_excel_with_images(
+    df: pd.DataFrame,
+    session: requests.Session,
+    *,
+    embed_images: bool = True,
+    image_row_height: int = 80,
+    timeout: float = 20.0,
+) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "products"
+    header_font = Font(bold=True)
+    for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=True), start=1):
+        ws.append(row)
+        if r_idx == 1:
+            for cell in ws[r_idx]:
+                cell.font = header_font
+                cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+    image_col_idx = None
+    if "image_local" in df.columns:
+        image_col_idx = df.columns.get_loc("image_local") + 1
+    elif "image" in df.columns:
+        image_col_idx = df.columns.get_loc("image") + 1
+
+    for idx, record in enumerate(df.to_dict(orient="records"), start=2):
+        ws.row_dimensions[idx].height = image_row_height
+        for col_idx in range(1, len(df.columns) + 1):
+            ws.cell(row=idx, column=col_idx).alignment = Alignment(vertical="top", wrap_text=True)
+        if not embed_images or image_col_idx is None:
+            continue
+        local_path = clean(record.get("image_local"))
+        if not local_path:
+            local_path = cache_product_image(session, record, timeout=timeout)
+        if not local_path or not os.path.exists(local_path):
+            continue
+        try:
+            pil_img = PILImage.open(local_path)
+            pil_img.thumbnail((72, 72))
+            thumb_path = local_path + ".thumb.png"
+            pil_img.save(thumb_path, format="PNG")
+            xl_img = XLImage(thumb_path)
+            xl_img.anchor = f"{get_column_letter(image_col_idx)}{idx}"
+            ws.add_image(xl_img)
+        except Exception:
+            continue
+
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        values = [str(col_name)] + [str(v) for v in df[col_name].head(200).tolist()]
+        width = min(max(len(v) for v in values) + 2, 50)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="products")
-        autosize_excel_columns(writer, "products", df)
+    wb.save(buffer)
     return buffer.getvalue()
+
+
+def build_export_package(
+    rows: list[dict],
+    session: requests.Session,
+    *,
+    label: str | None = None,
+    include_images: bool = True,
+    embed_images_in_excel: bool = True,
+    timeout: float = 20.0,
+) -> tuple[bytes, str]:
+    """建立 ZIP 匯出包：Excel + CSV + images/ + manifest.json"""
+    df = rows_to_dataframe(rows)
+    stamp = label or datetime.now().strftime("%Y%m%d_%H%M%S")
+    ensure_dir(EXPORT_DIR)
+
+    if include_images:
+        for record in rows:
+            local = cache_product_image(session, record, timeout=timeout)
+            record["image_local"] = local
+        df = rows_to_dataframe(rows)
+
+    excel_bytes = build_excel_with_images(
+        df,
+        session,
+        embed_images=embed_images_in_excel and include_images,
+        timeout=timeout,
+    )
+    csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    manifest = {
+        "app_version": APP_VERSION,
+        "exported_at": now_iso(),
+        "row_count": len(df),
+        "columns": EXCEL_COLUMNS,
+        "label": stamp,
+    }
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"hktv_products_{stamp}.xlsx", excel_bytes)
+        zf.writestr(f"hktv_products_{stamp}.csv", csv_bytes)
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        if include_images:
+            for record in rows:
+                local_path = clean(record.get("image_local"))
+                if local_path and os.path.exists(local_path):
+                    arcname = os.path.join("images", os.path.basename(local_path))
+                    zf.write(local_path, arcname=arcname)
+    filename = f"hktv_export_{stamp}.zip"
+    return zip_buffer.getvalue(), filename
+
+
+# =============================================================================
+# 檢查點 / 備份
+# =============================================================================
 
 
 def save_checkpoint(state: dict, label: str = "latest") -> str:
@@ -501,13 +904,23 @@ def save_checkpoint(state: dict, label: str = "latest") -> str:
         "seen_page_signatures": list(state.get("seen_page_signatures", set())),
         "stats": state.get("stats", {}),
         "settings": state.get("settings", {}),
+        "activity_log": state.get("activity_log", [])[-200:],
+        "website_key": state.get("website_key", "hktv_zh"),
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(serializable, fh, ensure_ascii=False, indent=2)
     return path
 
 
-def save_backup(df: pd.DataFrame, label: str | None = None) -> str | None:
+def load_checkpoint_bytes(data: bytes) -> dict:
+    payload = json.loads(data.decode("utf-8"))
+    payload["seen_product_ids"] = set(payload.get("seen_product_ids") or [])
+    payload["seen_page_signatures"] = set(payload.get("seen_page_signatures") or [])
+    return payload
+
+
+def save_backup(rows: list[dict], label: str | None = None) -> str | None:
+    df = rows_to_dataframe(rows)
     if df.empty:
         return None
     ensure_dir(BACKUP_DIR)
@@ -515,27 +928,20 @@ def save_backup(df: pd.DataFrame, label: str | None = None) -> str | None:
     csv_path = os.path.join(BACKUP_DIR, f"hktv_products_{stamp}.csv")
     xlsx_path = os.path.join(BACKUP_DIR, f"hktv_products_{stamp}.xlsx")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    session = get_session()
     with open(xlsx_path, "wb") as fh:
-        fh.write(dataframe_to_excel_bytes(df))
+        fh.write(build_excel_with_images(df, session, embed_images=False))
     return csv_path
 
 
-def load_checkpoint(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    data["seen_product_ids"] = set(data.get("seen_product_ids") or [])
-    data["seen_page_signatures"] = set(data.get("seen_page_signatures") or [])
-    return data
-
-
-# ---------------------------------------------------------------------------
-# Task model & splitting
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 任務建立 / 分割
+# =============================================================================
 
 
 def new_task(
     *,
-    mode: str,
+    method: str,
     categories: list[str] | None = None,
     keyword: str = "",
     price_range: str | None = None,
@@ -544,7 +950,8 @@ def new_task(
     label: str = "",
 ) -> dict[str, Any]:
     return {
-        "mode": mode,
+        "method": method,
+        "mode": method,
         "categories": list(categories or []),
         "keyword": keyword or "",
         "price_range": price_range,
@@ -553,7 +960,7 @@ def new_task(
         "page_number": 0,
         "done": False,
         "error": None,
-        "label": label or mode,
+        "label": label or method,
         "products_collected": 0,
     }
 
@@ -574,19 +981,13 @@ def split_oversized_task(
     task: dict,
     timeout: float = 30.0,
 ) -> list[dict]:
-    """Split a task that hit the pagination window into finer sub-tasks."""
     if int(task.get("split_depth") or 0) >= MAX_SPLIT_DEPTH:
         return []
 
     parent_code = (task.get("categories") or [None])[0]
     keyword = task.get("keyword") or ""
-    extra_filter: dict[str, Any] = {}
-    if task.get("price_range"):
-        extra_filter["priceRange"] = [task["price_range"]]
-    if task.get("brand"):
-        extra_filter["brand"] = [task["brand"]]
+    extra_filter = build_task_extra_filter(task)
 
-    # (a) child category codes from products
     if parent_code:
         children = discover_child_category_codes(
             session,
@@ -605,7 +1006,6 @@ def split_oversized_task(
                 for child in children
             ]
 
-    # (b) price range buckets
     if not task.get("price_range"):
         return [
             clone_task_for_split(
@@ -616,26 +1016,14 @@ def split_oversized_task(
             for bucket in DEFAULT_PRICE_RANGE_BUCKETS
         ]
 
-    # (c) brand facets
     if not task.get("brand"):
-        probe_filter = merge_filters(build_filter_from_task(task), None)
-        probe = hktv_search_request(
+        brands = fetch_brand_facets(
             session,
             keyword=keyword,
-            page_number=0,
-            page_size=1,
-            filter_obj=probe_filter,
-            aggregations=["brand"],
+            categories=task.get("categories"),
+            extra_filter=extra_filter or None,
             timeout=timeout,
         )
-        brand_agg = probe.get("aggregations", {}).get("brand") or {}
-        brands = []
-        if isinstance(brand_agg, dict):
-            brands = [
-                b
-                for b, _ in sorted(brand_agg.items(), key=lambda kv: kv[1], reverse=True)
-                if b and b not in ("OtherBrands", "ShippedfromMainland")
-            ][:MAX_BRAND_SPLITS]
         if brands:
             return [
                 clone_task_for_split(
@@ -645,7 +1033,6 @@ def split_oversized_task(
                 )
                 for brand_name in brands
             ]
-
     return []
 
 
@@ -670,7 +1057,7 @@ def expand_subcategory_tasks(
             continue
         child_tasks = [
             new_task(
-                mode="subcategory",
+                method="category",
                 categories=[child["code"]],
                 label=f"subcategory:{child['name']}",
             )
@@ -688,52 +1075,78 @@ def expand_subcategory_tasks(
     return expanded
 
 
-def build_initial_tasks(settings: dict) -> list[dict]:
-    mode = settings["mode"]
-    if mode == "keyword":
-        keywords = settings.get("keywords") or []
-        return [new_task(mode="keyword", keyword=kw, label=f"keyword:{kw}") for kw in keywords]
-    if mode == "category":
-        codes = settings.get("category_codes") or []
-        return [
-            new_task(mode="category", categories=[code], label=f"category:{code}")
-            for code in codes
-        ]
-    if mode == "subcategory":
-        codes = settings.get("category_codes") or []
-        base = [
-            new_task(mode="subcategory", categories=[code], label=f"subcategory:{code}")
-            for code in codes
-        ]
-        session = get_http_session()
-        return expand_subcategory_tasks(session, base, timeout=settings.get("timeout", 30))
-    if mode == "all_products":
-        session = get_http_session()
-        top_cats = fetch_top_level_categories(session, timeout=settings.get("timeout", 30))
+def build_tasks(cfg: dict, session: requests.Session | None = None) -> list[dict]:
+    method = cfg.get("method", "keyword")
+    session = session or build_session()
+    timeout = float(cfg.get("timeout", 30))
+    tasks: list[dict] = []
+
+    keywords = [clean(k) for k in cfg.get("keywords", []) if clean(k)]
+    category_codes = [clean(c) for c in cfg.get("category_codes", []) if clean(c)]
+    expand_subcats = bool(cfg.get("expand_subcategories", False))
+
+    if method == "keyword":
+        for kw in keywords:
+            tasks.append(new_task(method="keyword", keyword=kw, label=f"關鍵字:{kw}"))
+
+    elif method == "category":
+        for code in category_codes:
+            base = new_task(method="category", categories=[code], label=f"分類:{code}")
+            if expand_subcats:
+                tasks.extend(expand_subcategory_tasks(session, [base], timeout=timeout))
+            else:
+                tasks.append(base)
+
+    elif method == "both":
+        if not keywords and not category_codes:
+            return []
+        if keywords and category_codes:
+            for code in category_codes:
+                for kw in keywords:
+                    tasks.append(
+                        new_task(
+                            method="both",
+                            categories=[code],
+                            keyword=kw,
+                            label=f"分類:{code}+關鍵字:{kw}",
+                        )
+                    )
+        elif keywords:
+            for kw in keywords:
+                tasks.append(new_task(method="keyword", keyword=kw, label=f"關鍵字:{kw}"))
+        else:
+            for code in category_codes:
+                tasks.append(new_task(method="category", categories=[code], label=f"分類:{code}"))
+
+    elif method == "all":
+        top_cats = fetch_top_level_categories(session, timeout=timeout)
         if not top_cats:
-            return [new_task(mode="all_products", label="all_products")]
-        return [
-            new_task(
-                mode="all_products",
-                categories=[item["code"]],
-                label=f"all_products:{item['code']}",
-            )
-            for item in top_cats
-        ]
-    return []
+            tasks.append(new_task(method="all", label="全站商品"))
+        else:
+            for item in top_cats:
+                tasks.append(
+                    new_task(
+                        method="all",
+                        categories=[item["code"]],
+                        label=f"全站:{item['code']}",
+                    )
+                )
+    return tasks
 
 
-# ---------------------------------------------------------------------------
-# Scraper step engine
-# ---------------------------------------------------------------------------
+# =============================================================================
+# 狀態管理
+# =============================================================================
 
 
 def init_state() -> None:
-    defaults = {
+    defaults: dict[str, Any] = {
         "app_version": APP_VERSION,
         "initialized": True,
         "http_session": None,
+        "website_key": "hktv_zh",
         "running": False,
+        "auto_run": False,
         "tasks": [],
         "task_idx": 0,
         "rows": [],
@@ -748,7 +1161,9 @@ def init_state() -> None:
         },
         "settings": {},
         "last_message": "",
-        "expanded_all_product_categories": False,
+        "activity_log": [],
+        "preview_sort": "預設（抓取順序）",
+        "last_backup_count": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -756,13 +1171,17 @@ def init_state() -> None:
                 st.session_state[key] = set()
             elif isinstance(value, dict):
                 st.session_state[key] = deepcopy(value)
+            elif isinstance(value, list):
+                st.session_state[key] = list(value)
             else:
                 st.session_state[key] = value
 
 
 def reset_run_state(keep_settings: bool = True) -> None:
     settings = deepcopy(st.session_state.get("settings", {}))
-    close_http_session()
+    website_key = st.session_state.get("website_key", "hktv_zh")
+    preview_sort = st.session_state.get("preview_sort", "預設（抓取順序）")
+    close_session()
     st.session_state.tasks = []
     st.session_state.task_idx = 0
     st.session_state.rows = []
@@ -776,21 +1195,25 @@ def reset_run_state(keep_settings: bool = True) -> None:
         "errors": 0,
     }
     st.session_state.running = False
+    st.session_state.auto_run = False
     st.session_state.last_message = ""
-    st.session_state.expanded_all_product_categories = False
+    st.session_state.activity_log = []
+    st.session_state.last_backup_count = 0
     st.session_state.http_session = None
+    st.session_state.website_key = website_key
+    st.session_state.preview_sort = preview_sort
     if keep_settings:
         st.session_state.settings = settings
 
 
-def expand_all_product_category_tasks(settings: dict) -> int:
-    """Continuously discover top-level categories and append missing tasks."""
-    session = get_http_session()
-    top_cats = fetch_top_level_categories(session, timeout=settings.get("timeout", 30))
+def expand_all_product_category_tasks(cfg: dict) -> int:
+    """持續發現頂層分類並追加任務（無一次性 gate）。"""
+    session = get_session()
+    top_cats = fetch_top_level_categories(session, timeout=float(cfg.get("timeout", 30)))
     existing = {
         tuple(task.get("categories") or [])
         for task in st.session_state.tasks
-        if task.get("mode") == "all_products"
+        if task.get("method") == "all"
     }
     added = 0
     insert_at = len(st.session_state.tasks)
@@ -800,53 +1223,53 @@ def expand_all_product_category_tasks(settings: dict) -> int:
             continue
         st.session_state.tasks.insert(
             insert_at,
-            new_task(
-                mode="all_products",
-                categories=[item["code"]],
-                label=f"all_products:{item['code']}",
-            ),
+            new_task(method="all", categories=[item["code"]], label=f"全站:{item['code']}"),
         )
         existing.add(key)
         added += 1
         insert_at += 1
+    if added:
+        append_activity(f"新增 {added} 個頂層分類任務", "info")
     return added
 
 
-def run_one_step(settings: dict) -> dict[str, Any]:
-    """Fetch a single page for the current task. Returns a status dict."""
-    init_state()
-    session = get_http_session()
+# =============================================================================
+# 執行引擎
+# =============================================================================
 
-    if settings.get("mode") == "all_products":
-        expand_all_product_category_tasks(settings)
+
+def run_one_step(cfg: dict) -> dict[str, Any]:
+    init_state()
+    session = get_session()
+
+    if cfg.get("method") == "all":
+        expand_all_product_category_tasks(cfg)
 
     tasks: list[dict] = st.session_state.tasks
     if not tasks:
-        return {"status": "idle", "message": "No tasks queued."}
+        return {"status": "idle", "message": "尚未建立任務。"}
 
     task_idx = st.session_state.task_idx
     while task_idx < len(tasks) and tasks[task_idx].get("done"):
         task_idx += 1
     st.session_state.task_idx = task_idx
     if task_idx >= len(tasks):
-        return {"status": "complete", "message": "All tasks finished."}
+        st.session_state.auto_run = False
+        return {"status": "complete", "message": "所有任務已完成。"}
 
     task = tasks[task_idx]
-    page_size = int(settings.get("page_size") or DEFAULT_PAGE_SIZE)
+    page_size = int(cfg.get("page_size") or DEFAULT_PAGE_SIZE)
     page_number = int(task.get("page_number") or 0)
-    max_pages = int(settings.get("max_pages") or 0)
-    product_limit = int(settings.get("product_limit") or 0)
-    timeout = float(settings.get("timeout") or 30)
+    cfg_max_pages = int(cfg.get("max_pages") or 0)
+    product_limit = int(cfg.get("limit") or 0)
+    timeout = float(cfg.get("timeout") or 30)
     keyword = task.get("keyword") or ""
     categories = list(task.get("categories") or [])
     price_range = task.get("price_range")
     brand = task.get("brand")
-
-    extra_filter: dict[str, Any] = {}
-    if price_range:
-        extra_filter["priceRange"] = [price_range]
-    if brand:
-        extra_filter["brand"] = [brand]
+    extra_filter = build_task_extra_filter(task)
+    use_pdp_fallback = bool(cfg.get("use_pdp_fallback", False))
+    site_key = cfg.get("website_key", st.session_state.get("website_key", "hktv_zh"))
 
     try:
         result = hktv_fetch_page(
@@ -863,31 +1286,34 @@ def run_one_step(settings: dict) -> dict[str, Any]:
         st.session_state.stats["errors"] += 1
         task["done"] = True
         st.session_state.task_idx = task_idx + 1
+        append_activity(f"任務錯誤：{exc}", "error")
         return {"status": "error", "message": str(exc)}
 
     hits = result.get("hits") or []
     total = int(result.get("total") or 0)
     st.session_state.stats["pages_fetched"] += 1
 
-    sig = page_signature(task_idx, page_number, categories, keyword, price_range, brand)
+    sig = task_page_signature(task_idx, page_number, categories, keyword, price_range, brand)
     repeated_page = sig in st.session_state.seen_page_signatures
     st.session_state.seen_page_signatures.add(sig)
 
-    max_page_idx = api_max_page_number(page_size)
-    at_window_limit = page_number >= max_page_idx
+    max_page = api_max_page_number(page_size)
+    if cfg_max_pages > 0:
+        max_page = min(max_page, cfg_max_pages - 1)
+    at_window_limit = page_number >= max_page
     full_page = len(hits) >= page_size
 
     if repeated_page or (at_window_limit and full_page):
         sub_tasks = split_oversized_task(session, task, timeout=timeout)
         if sub_tasks:
-            tasks[task_idx + 1 : task_idx + 1] = sub_tasks
+            insert_split_tasks(tasks, task_idx, sub_tasks)
             st.session_state.stats["tasks_split"] += len(sub_tasks)
             task["done"] = True
             st.session_state.stats["tasks_completed"] += 1
             st.session_state.task_idx = task_idx + 1
-            reason = "repeated page" if repeated_page else "pagination window"
-            msg = f"Split task ({reason}) into {len(sub_tasks)} sub-tasks."
-            st.session_state.last_message = msg
+            reason = "重複頁面" if repeated_page else "分頁視窗上限"
+            msg = f"已分割任務（{reason}）→ {len(sub_tasks)} 個子任務"
+            append_activity(msg, "warning")
             return {"status": "split", "message": msg, "added_tasks": len(sub_tasks)}
 
     added = 0
@@ -897,7 +1323,13 @@ def run_one_step(settings: dict) -> dict[str, Any]:
             continue
         if product_id in st.session_state.seen_product_ids:
             continue
-        row = hit_to_row(hit, task=task)
+        row = parse_hktv_hit(
+            hit,
+            task=task,
+            site_key=site_key,
+            session=session,
+            use_pdp_fallback=use_pdp_fallback,
+        )
         st.session_state.rows.append(row)
         st.session_state.seen_product_ids.add(product_id)
         added += 1
@@ -906,44 +1338,48 @@ def run_one_step(settings: dict) -> dict[str, Any]:
     st.session_state.stats["products_added"] += added
 
     stop_due_to_limit = product_limit > 0 and len(st.session_state.rows) >= product_limit
-    stop_due_to_max_pages = max_pages > 0 and (page_number + 1) >= max_pages
+    stop_due_to_max_pages = cfg_max_pages > 0 and (page_number + 1) >= cfg_max_pages
     no_more_hits = len(hits) == 0
-    natural_end = (page_number + 1) * page_size >= total
+    natural_end = total > 0 and (page_number + 1) * page_size >= total
 
-    if stop_due_to_limit or stop_due_to_max_pages or no_more_hits or natural_end:
+    if stop_due_to_limit:
+        st.session_state.auto_run = False
         task["done"] = True
         st.session_state.stats["tasks_completed"] += 1
         st.session_state.task_idx = task_idx + 1
-        msg = f"Task done ({task.get('label', task_idx)}); +{added} products on last page."
-        st.session_state.last_message = msg
-        return {
-            "status": "task_done",
-            "message": msg,
-            "added": added,
-            "total_rows": len(st.session_state.rows),
-        }
+        msg = f"已達商品上限 {product_limit}"
+        append_activity(msg, "info")
+        return {"status": "limit", "message": msg, "added": added}
+
+    if stop_due_to_max_pages or no_more_hits or natural_end:
+        task["done"] = True
+        st.session_state.stats["tasks_completed"] += 1
+        st.session_state.task_idx = task_idx + 1
+        msg = f"任務完成：{task.get('label', task_idx)}（本頁 +{added}）"
+        append_activity(msg, "info")
+        return {"status": "task_done", "message": msg, "added": added}
 
     if at_window_limit and full_page:
         sub_tasks = split_oversized_task(session, task, timeout=timeout)
         if sub_tasks:
-            tasks[task_idx + 1 : task_idx + 1] = sub_tasks
+            insert_split_tasks(tasks, task_idx, sub_tasks)
             st.session_state.stats["tasks_split"] += len(sub_tasks)
             task["done"] = True
             st.session_state.stats["tasks_completed"] += 1
             st.session_state.task_idx = task_idx + 1
-            msg = f"Reached pagination window; split into {len(sub_tasks)} sub-tasks."
-            st.session_state.last_message = msg
+            msg = f"達分頁上限，已分割為 {len(sub_tasks)} 個子任務"
+            append_activity(msg, "warning")
             return {"status": "split", "message": msg, "added_tasks": len(sub_tasks)}
         task["done"] = True
         st.session_state.stats["tasks_completed"] += 1
         st.session_state.task_idx = task_idx + 1
-        msg = "Reached pagination window and cannot split further."
-        st.session_state.last_message = msg
+        msg = "達分頁上限且無法再分割"
+        append_activity(msg, "error")
         return {"status": "window_stop", "message": msg}
 
     task["page_number"] = page_number + 1
-    msg = f"Page {page_number} fetched (+{added}); total rows={len(st.session_state.rows)}"
-    st.session_state.last_message = msg
+    msg = f"第 {page_number} 頁完成 +{added}（累計 {len(st.session_state.rows)}）"
+    append_activity(msg, "info")
     return {
         "status": "progress",
         "message": msg,
@@ -953,107 +1389,244 @@ def run_one_step(settings: dict) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
+def maybe_auto_backup(cfg: dict) -> None:
+    every = int(cfg.get("auto_backup_every") or 0)
+    if every <= 0:
+        return
+    count = len(st.session_state.rows)
+    if count <= 0 or count < st.session_state.last_backup_count + every:
+        return
+    path = save_backup(st.session_state.rows, label=f"auto_{count}")
+    if path:
+        st.session_state.last_backup_count = count
+        append_activity(f"自動備份：{path}", "info")
+
+
+# =============================================================================
+# Streamlit UI（繁體中文）
+# =============================================================================
 
 
 def render_sidebar() -> dict:
-    st.sidebar.header("HKTVmall Scraper")
-    st.sidebar.caption(f"Version {APP_VERSION}")
+    st.sidebar.title("HKTVmall 爬蟲")
+    st.sidebar.caption(f"版本 {APP_VERSION}")
     st.sidebar.caption(
-        "Large result sets are fetched via automatic task splitting "
-        "(sub-categories, price buckets, brands) to bypass the ~10,000 offset API cap."
+        "大型結果集會自動分割任務（子分類 → 價格區間 → 品牌），"
+        "突破 API 約 10,000 offset 分頁上限。"
     )
 
-    mode = st.sidebar.selectbox(
-        "Scrape method",
-        options=["keyword", "category", "subcategory", "all_products"],
+    website_key = st.sidebar.selectbox(
+        "網站",
+        options=list(WEBSITES.keys()),
+        format_func=lambda k: WEBSITES[k]["label"],
+        index=0,
+    )
+    st.session_state.website_key = website_key
+
+    method = st.sidebar.selectbox(
+        "抓取方式",
+        options=["keyword", "category", "both", "all"],
         format_func=lambda x: {
-            "keyword": "Keyword search",
-            "category": "Category code(s)",
-            "subcategory": "Expand subcategories",
-            "all_products": "All products (by top-level category)",
+            "keyword": "關鍵字搜尋",
+            "category": "分類代碼",
+            "both": "分類 + 關鍵字",
+            "all": "全站商品（按頂層分類）",
         }[x],
     )
 
     keywords: list[str] = []
     category_codes: list[str] = []
-    if mode == "keyword":
-        raw_keywords = st.sidebar.text_area("Keywords (one per line)", value="")
-        keywords = [clean(line) for line in raw_keywords.splitlines() if clean(line)]
-    else:
-        raw_codes = st.sidebar.text_area("Category code(s), one per line", value="")
-        category_codes = [clean(line) for line in raw_codes.splitlines() if clean(line)]
+    expand_subcategories = False
 
-    page_size = st.sidebar.number_input("Page size", min_value=10, max_value=120, value=DEFAULT_PAGE_SIZE, step=10)
+    if method in {"keyword", "both"}:
+        raw_kw = st.sidebar.text_area("關鍵字（每行一個）", value="", height=100)
+        keywords = [clean(x) for x in raw_kw.splitlines() if clean(x)]
+
+    if method in {"category", "both", "all"} and method != "all":
+        raw_cat = st.sidebar.text_area("分類代碼（每行一個）", value="", height=100)
+        category_codes = [clean(x) for x in raw_cat.splitlines() if clean(x)]
+        expand_subcategories = st.sidebar.checkbox("展開子分類（最多 4 層）", value=False)
+
+    page_size = st.sidebar.number_input("每頁筆數", min_value=10, max_value=120, value=DEFAULT_PAGE_SIZE, step=10)
     max_pages = st.sidebar.number_input(
-        "Max pages per task (0 = unlimited)",
+        "每任務最多頁數（0 = 無限制）",
         min_value=0,
         max_value=10000,
         value=0,
         step=1,
     )
-    product_limit = st.sidebar.number_input(
-        "Product limit (0 = unlimited)",
+    limit = st.sidebar.number_input(
+        "商品上限（0 = 無限制）",
         min_value=0,
         max_value=10_000_000,
         value=0,
         step=100,
     )
-    timeout = st.sidebar.number_input("Request timeout (seconds)", min_value=5, max_value=120, value=30, step=5)
-    steps_per_click = st.sidebar.number_input("Steps per Run click", min_value=1, max_value=50, value=1, step=1)
-    auto_backup_every = st.sidebar.number_input("Auto-backup every N products (0=off)", min_value=0, max_value=100000, value=0, step=500)
+    timeout = st.sidebar.number_input("請求逾時（秒）", min_value=5, max_value=120, value=30, step=5)
+    steps_per_loop = st.sidebar.number_input("每次迴圈步數", min_value=1, max_value=100, value=3, step=1)
+    loop_delay = st.sidebar.number_input("迴圈間隔（秒）", min_value=0.0, max_value=5.0, value=0.2, step=0.1)
+    auto_backup_every = st.sidebar.number_input("每 N 筆自動備份（0=關）", min_value=0, max_value=100000, value=0, step=500)
+    use_pdp_fallback = st.sidebar.checkbox("缺少欄位時抓取商品頁補充", value=False)
+    include_images = st.sidebar.checkbox("匯出時下載商品圖片", value=True)
+    embed_images_in_excel = st.sidebar.checkbox("Excel 內嵌縮圖", value=True)
 
     return {
-        "mode": mode,
+        "method": method,
         "keywords": keywords,
         "category_codes": category_codes,
+        "expand_subcategories": expand_subcategories,
         "page_size": int(page_size),
         "max_pages": int(max_pages),
-        "product_limit": int(product_limit),
+        "limit": int(limit),
         "timeout": float(timeout),
-        "steps_per_click": int(steps_per_click),
+        "steps_per_loop": int(steps_per_loop),
+        "loop_delay": float(loop_delay),
         "auto_backup_every": int(auto_backup_every),
+        "use_pdp_fallback": use_pdp_fallback,
+        "include_images": include_images,
+        "embed_images_in_excel": embed_images_in_excel,
+        "website_key": website_key,
     }
+
+
+def render_activity_log() -> None:
+    with st.expander("活動紀錄", expanded=False):
+        logs = list(reversed(st.session_state.get("activity_log", [])[-80:]))
+        if not logs:
+            st.write("尚無紀錄。")
+            return
+        for entry in logs:
+            icon = {"info": "ℹ️", "warning": "⚠️", "error": "❌"}.get(entry.get("level", "info"), "•")
+            st.text(f"{icon} [{entry.get('time', '')}] {entry.get('message', '')}")
+
+
+def render_task_queue() -> None:
+    with st.expander("任務佇列", expanded=False):
+        tasks = st.session_state.tasks
+        if not tasks:
+            st.write("尚未建立任務。")
+            return
+        task_df = pd.DataFrame(
+            [
+                {
+                    "#": idx,
+                    "標籤": t.get("label"),
+                    "方式": t.get("method"),
+                    "分類": ",".join(t.get("categories") or []),
+                    "關鍵字": t.get("keyword"),
+                    "價格區間": t.get("price_range"),
+                    "品牌": t.get("brand"),
+                    "分割深度": t.get("split_depth"),
+                    "頁碼": t.get("page_number"),
+                    "完成": t.get("done"),
+                    "商品數": t.get("products_collected"),
+                    "錯誤": t.get("error"),
+                }
+                for idx, t in enumerate(tasks)
+            ]
+        )
+        st.dataframe(task_df, use_container_width=True, height=280)
+
+
+def render_preview(cfg: dict) -> None:
+    rows = st.session_state.rows
+    if not rows:
+        st.info("尚無資料。請建立任務後按「開始」。")
+        return
+
+    sort_key = st.selectbox(
+        "預覽排序",
+        options=list(SORT_OPTIONS.keys()),
+        index=list(SORT_OPTIONS.keys()).index(st.session_state.get("preview_sort", "預設（抓取順序）")),
+        key="preview_sort_select",
+    )
+    st.session_state.preview_sort = sort_key
+    df = sort_dataframe(rows_to_dataframe(rows), sort_key)
+
+    st.subheader("資料預覽")
+    st.caption(f"共 {len(df)} 筆（顯示前 200 筆）")
+    st.dataframe(df.head(200), use_container_width=True)
+
+    session = get_session()
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.download_button(
+            "下載 CSV",
+            data=df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            "下載 Excel",
+            data=build_excel_with_images(
+                df,
+                session,
+                embed_images=cfg.get("embed_images_in_excel", True) and cfg.get("include_images", True),
+                timeout=cfg.get("timeout", 30),
+            ),
+            file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with c3:
+        zip_bytes, zip_name = build_export_package(
+            st.session_state.rows,
+            session,
+            include_images=cfg.get("include_images", True),
+            embed_images_in_excel=cfg.get("embed_images_in_excel", True),
+            timeout=cfg.get("timeout", 30),
+        )
+        st.download_button(
+            "下載完整匯出包（ZIP）",
+            data=zip_bytes,
+            file_name=zip_name,
+            mime="application/zip",
+            use_container_width=True,
+        )
+    with c4:
+        if st.button("立即備份", use_container_width=True):
+            path = save_backup(st.session_state.rows)
+            if path:
+                st.success(f"已備份：{path}")
+            else:
+                st.warning("沒有資料可備份。")
 
 
 def render_main() -> None:
     init_state()
-    settings = render_sidebar()
+    cfg = render_sidebar()
 
-    st.title("HKTVmall Product Scraper")
+    st.title("HKTVmall 商品爬蟲")
     st.write(
-        "Scrape HKTVmall search results with checkpointing, deduplication, and unlimited "
-        "coverage via automatic task splitting when the API pagination window is reached."
+        "從 HKTVmall 搜尋 API 抓取商品資料，支援檢查點還原、去重、"
+        "Excel 圖片匯出，以及自動任務分割以取得完整商品清單。"
     )
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        if st.button("Prepare tasks", use_container_width=True):
+    b1, b2, b3, b4, b5 = st.columns(5)
+    with b1:
+        if st.button("建立任務", use_container_width=True):
             reset_run_state(keep_settings=True)
-            st.session_state.settings = deepcopy(settings)
-            st.session_state.tasks = build_initial_tasks(settings)
-            st.session_state.running = False
-            st.success(f"Prepared {len(st.session_state.tasks)} task(s).")
-    with col2:
-        if st.button("Run step(s)", use_container_width=True):
-            st.session_state.settings = deepcopy(settings)
+            st.session_state.settings = deepcopy(cfg)
+            st.session_state.tasks = build_tasks(cfg, session=get_session())
+            append_activity(f"已建立 {len(st.session_state.tasks)} 個任務", "info")
+            st.success(f"已建立 {len(st.session_state.tasks)} 個任務")
+    with b2:
+        if st.button("開始", use_container_width=True):
+            st.session_state.settings = deepcopy(cfg)
             if not st.session_state.tasks:
-                st.session_state.tasks = build_initial_tasks(settings)
+                st.session_state.tasks = build_tasks(cfg, session=get_session())
+            st.session_state.auto_run = True
             st.session_state.running = True
-            results = []
-            for _ in range(max(1, settings["steps_per_click"])):
-                step = run_one_step(st.session_state.settings)
-                results.append(step)
-                if step.get("status") in {"complete", "idle"}:
-                    break
-                if settings["product_limit"] > 0 and len(st.session_state.rows) >= settings["product_limit"]:
-                    break
+            append_activity("開始自動抓取", "info")
+    with b3:
+        if st.button("暫停", use_container_width=True):
+            st.session_state.auto_run = False
             st.session_state.running = False
-            st.info(results[-1].get("message", "Step finished."))
-    with col3:
-        if st.button("Save checkpoint", use_container_width=True):
+            append_activity("已暫停", "warning")
+    with b4:
+        if st.button("儲存檢查點", use_container_width=True):
             path = save_checkpoint(
                 {
                     "rows": st.session_state.rows,
@@ -1063,98 +1636,71 @@ def render_main() -> None:
                     "seen_page_signatures": st.session_state.seen_page_signatures,
                     "stats": st.session_state.stats,
                     "settings": st.session_state.settings,
+                    "activity_log": st.session_state.activity_log,
+                    "website_key": st.session_state.website_key,
                 }
             )
-            st.success(f"Checkpoint saved: {path}")
-    with col4:
-        if st.button("Reset", use_container_width=True):
+            append_activity(f"檢查點已儲存：{path}", "info")
+            st.success(f"檢查點已儲存：{path}")
+    with b5:
+        if st.button("重設", use_container_width=True):
             reset_run_state(keep_settings=False)
-            st.warning("Run state cleared.")
+            st.warning("執行狀態已清除")
 
-    uploaded = st.file_uploader("Restore checkpoint JSON", type=["json"])
+    uploaded = st.file_uploader("還原檢查點 JSON", type=["json"])
     if uploaded is not None:
         try:
-            data = json.loads(uploaded.getvalue().decode("utf-8"))
+            data = load_checkpoint_bytes(uploaded.getvalue())
             st.session_state.rows = data.get("rows", [])
             st.session_state.tasks = data.get("tasks", [])
             st.session_state.task_idx = data.get("task_idx", 0)
-            st.session_state.seen_product_ids = set(data.get("seen_product_ids") or [])
-            st.session_state.seen_page_signatures = set(data.get("seen_page_signatures") or [])
+            st.session_state.seen_product_ids = data.get("seen_product_ids", set())
+            st.session_state.seen_page_signatures = data.get("seen_page_signatures", set())
             st.session_state.stats = data.get("stats", st.session_state.stats)
             st.session_state.settings = data.get("settings", st.session_state.settings)
-            st.success("Checkpoint restored.")
+            st.session_state.activity_log = data.get("activity_log", [])
+            st.session_state.website_key = data.get("website_key", "hktv_zh")
+            append_activity("已還原檢查點", "info")
+            st.success("檢查點還原成功。")
         except Exception as exc:
-            st.error(f"Failed to restore checkpoint: {exc}")
+            st.error(f"還原失敗：{exc}")
 
     stats = st.session_state.stats
-    st.subheader("Run status")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Products", len(st.session_state.rows))
-    m2.metric("Tasks done", stats.get("tasks_completed", 0))
-    m3.metric("Pages fetched", stats.get("pages_fetched", 0))
-    m4.metric("Tasks split", stats.get("tasks_split", 0))
-    m5.metric("Errors", stats.get("errors", 0))
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("商品數", len(st.session_state.rows))
+    m2.metric("已完成任務", stats.get("tasks_completed", 0))
+    m3.metric("已抓取頁數", stats.get("pages_fetched", 0))
+    m4.metric("分割任務", stats.get("tasks_split", 0))
+    m5.metric("錯誤", stats.get("errors", 0))
+    m6.metric("目前任務", st.session_state.task_idx)
     if st.session_state.last_message:
         st.caption(st.session_state.last_message)
 
-    df = rows_to_dataframe(st.session_state.rows)
-    if not df.empty:
-        st.subheader("Preview")
-        st.dataframe(df.head(200), use_container_width=True)
+    if st.session_state.auto_run:
+        active_cfg = st.session_state.get("settings") or cfg
+        for _ in range(max(1, active_cfg.get("steps_per_loop", 1))):
+            step = run_one_step(active_cfg)
+            maybe_auto_backup(active_cfg)
+            if step.get("status") in {"complete", "idle", "limit"}:
+                st.session_state.auto_run = False
+                st.session_state.running = False
+                break
+            if active_cfg.get("limit", 0) > 0 and len(st.session_state.rows) >= active_cfg["limit"]:
+                st.session_state.auto_run = False
+                st.session_state.running = False
+                break
+        delay = float(active_cfg.get("loop_delay", 0.2))
+        if delay > 0:
+            time.sleep(delay)
+        st.rerun()
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "Download CSV",
-                data=df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        with c2:
-            st.download_button(
-                "Download Excel",
-                data=dataframe_to_excel_bytes(df),
-                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        if settings.get("auto_backup_every", 0) > 0:
-            every = settings["auto_backup_every"]
-            if len(df) % every == 0:
-                path = save_backup(df, label=f"auto_{len(df)}")
-                if path:
-                    st.caption(f"Auto-backup saved: {path}")
-
-    with st.expander("Task queue", expanded=False):
-        if st.session_state.tasks:
-            task_df = pd.DataFrame(
-                [
-                    {
-                        "idx": idx,
-                        "label": t.get("label"),
-                        "mode": t.get("mode"),
-                        "categories": ",".join(t.get("categories") or []),
-                        "keyword": t.get("keyword"),
-                        "price_range": t.get("price_range"),
-                        "brand": t.get("brand"),
-                        "split_depth": t.get("split_depth"),
-                        "page_number": t.get("page_number"),
-                        "done": t.get("done"),
-                        "products": t.get("products_collected"),
-                        "error": t.get("error"),
-                    }
-                    for idx, t in enumerate(st.session_state.tasks)
-                ]
-            )
-            st.dataframe(task_df, use_container_width=True)
-        else:
-            st.write("No tasks yet. Click **Prepare tasks**.")
+    render_preview(cfg)
+    render_activity_log()
+    render_task_queue()
 
 
 def main() -> None:
-    st.set_page_config(page_title="HKTVmall Scraper", layout="wide")
+    st.set_page_config(page_title="HKTVmall 商品爬蟲", page_icon="🛒", layout="wide")
     render_main()
 
 
