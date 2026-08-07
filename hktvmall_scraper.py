@@ -38,7 +38,7 @@ from urllib3.util.retry import Retry
 APP_VERSION = "1.4-webapp-unlimited"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
-HKTV_INDEX_NAME = "hktvproduct"
+HKTV_INDEX_NAME = "hktvProduct"
 
 API_MAX_OFFSET = 10000
 DEFAULT_PAGE_SIZE = 60
@@ -49,7 +49,8 @@ DEFAULT_PRICE_RANGE_BUCKETS = [
     "200-500",
     "500-1000",
     "1000-3000",
-    "3000-",
+    "3000-10000",
+    "10000-999999",
 ]
 MAX_SPLIT_DEPTH = 6
 MAX_SUBCATEGORY_DEPTH = 4
@@ -124,6 +125,13 @@ SORT_OPTIONS: dict[str, tuple[str, bool] | None] = {
     "評論數 多→少": ("number_of_reviews", False),
     "品牌 A→Z": ("brand", True),
     "名稱 A→Z": ("name", True),
+}
+
+API_SORT_OPTIONS: dict[str, str] = {
+    "銷量（高→低）": "salesVolume:desc",
+    "價格（低→高）": "price:asc",
+    "價格（高→低）": "price:desc",
+    "相關性 / 預設": "",
 }
 
 SKIP_BRAND_FACETS = frozenset({"OtherBrands", "ShippedfromMainland"})
@@ -362,30 +370,54 @@ def hktv_search_request(
     filter_obj: dict | None = None,
     aggregations: list[str] | None = None,
     extra_filter: dict | None = None,
+    sort_by: str = "salesVolume:desc",
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     merged_filter = merge_filters(filter_obj, extra_filter)
-    price_ranges = merged_filter.pop("priceRange", None)
-    range_obj: dict[str, str] = {}
-    if price_ranges:
-        bucket = price_ranges[0] if isinstance(price_ranges, list) else str(price_ranges)
-        if bucket:
-            range_obj["sellingPrice"] = bucket
+
+    query_parts: list[str] = []
+    for code in merged_filter.get("category") or []:
+        query_parts.append(f":category:{code}")
+    if sort_by:
+        request_query = f"{''.join(query_parts)}:{sort_by}" if query_parts else f":{sort_by}"
+    else:
+        request_query = "".join(query_parts)
 
     request_body: dict[str, Any] = {
         "indexName": HKTV_INDEX_NAME,
         "keyword": keyword or "",
+        "highlight": ["*"],
         "page": {"pageNumber": page_number, "pageSize": page_size},
         "filter": merged_filter,
-        "aggregations": aggregations or ["category", "brand"],
     }
-    if range_obj:
-        request_body["range"] = range_obj
+    if sort_by:
+        request_body["sort"] = sort_by
+    if request_query:
+        request_body["query"] = request_query
+    if aggregations is not None:
+        request_body["aggregations"] = aggregations
 
-    response = session.post(HKTV_SEARCH_URL, json={"requests": [request_body]}, timeout=timeout)
+    response = session.post(
+        HKTV_SEARCH_URL,
+        headers={
+            "accept": "application/json",
+            "accept-language": "zh-HK,zh;q=0.9,en;q=0.7",
+            "content-type": "application/json",
+            "authorization": f"ApiKey {HKTV_API_KEY}",
+            "origin": "https://www.hktvmall.com",
+            "referer": "https://www.hktvmall.com/hktv/zh/",
+            "user-agent": (
+                "Mozilla/5.0 (Linux; Android 10; Mobile) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Mobile Safari/537.36"
+            ),
+        },
+        json={"requests": [request_body]},
+        timeout=timeout,
+    )
     response.raise_for_status()
     payload = response.json()
-    if payload.get("code") != 200:
+    if payload.get("code") not in (None, 200) and not payload.get("results"):
         raise RuntimeError(payload.get("message") or "HKTV search API error")
     results = payload.get("results") or []
     if not results:
@@ -408,6 +440,7 @@ def hktv_fetch_page(
     categories: list[str] | None = None,
     aggregations: list[str] | None = None,
     extra_filter: dict | None = None,
+    sort_by: str = "salesVolume:desc",
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     filter_obj: dict[str, Any] = {}
@@ -421,6 +454,7 @@ def hktv_fetch_page(
         filter_obj=filter_obj,
         aggregations=aggregations,
         extra_filter=extra_filter,
+        sort_by=sort_by,
         timeout=timeout,
     )
 
@@ -1279,6 +1313,7 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
             page_size=page_size,
             categories=categories or None,
             extra_filter=extra_filter or None,
+            sort_by=cfg.get("sort_by") or "salesVolume:desc",
             timeout=timeout,
         )
     except Exception as exc:
@@ -1470,6 +1505,13 @@ def render_sidebar() -> dict:
     include_images = st.sidebar.checkbox("匯出時下載商品圖片", value=True)
     embed_images_in_excel = st.sidebar.checkbox("Excel 內嵌縮圖", value=True)
 
+    sort_label = st.sidebar.selectbox(
+        "搜尋排序（API）",
+        options=list(API_SORT_OPTIONS.keys()),
+        index=0,
+        help="影響抓取時 API 回傳順序；預覽表格排序可在下方另行選擇。",
+    )
+
     return {
         "method": method,
         "keywords": keywords,
@@ -1486,6 +1528,7 @@ def render_sidebar() -> dict:
         "include_images": include_images,
         "embed_images_in_excel": embed_images_in_excel,
         "website_key": website_key,
+        "sort_by": API_SORT_OPTIONS[sort_label],
     }
 
 
