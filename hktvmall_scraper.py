@@ -285,6 +285,43 @@ def api_max_page_number(page_size: int) -> int:
     return max(0, (API_MAX_OFFSET // page_size) - 1)
 
 
+def should_attempt_split_on_end(task: dict, page_number: int, hits: list, page_size: int) -> bool:
+    """True when pagination likely hit the API cliff before all products were fetched."""
+    if int(task.get("split_depth") or 0) >= MAX_SPLIT_DEPTH:
+        return False
+    if len(hits) >= page_size:
+        return False
+    if page_number <= 0 and not hits:
+        return False
+    # Paginated at least once, or already collected products, but page is now empty/partial.
+    if page_number > 0 or int(task.get("products_collected") or 0) > 0:
+        return True
+    return False
+
+
+def try_split_task(
+    session: requests.Session,
+    tasks: list[dict],
+    task_idx: int,
+    task: dict,
+    *,
+    reason: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Attempt to split an oversized task; return a status dict if split succeeded."""
+    sub_tasks = split_oversized_task(session, task, timeout=timeout)
+    if not sub_tasks:
+        return None
+    insert_split_tasks(tasks, task_idx, sub_tasks)
+    st.session_state.stats["tasks_split"] += len(sub_tasks)
+    task["done"] = True
+    st.session_state.stats["tasks_completed"] += 1
+    st.session_state.task_idx = task_idx + 1
+    msg = f"已分割任務（{reason}）→ {len(sub_tasks)} 個子任務"
+    append_activity(msg, "warning")
+    return {"status": "split", "message": msg, "added_tasks": len(sub_tasks)}
+
+
 def build_task_extra_filter(task: dict) -> dict[str, Any]:
     extra: dict[str, Any] = {}
     if task.get("price_range"):
@@ -1339,17 +1376,13 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
     full_page = len(hits) >= page_size
 
     if repeated_page or (at_window_limit and full_page):
-        sub_tasks = split_oversized_task(session, task, timeout=timeout)
-        if sub_tasks:
-            insert_split_tasks(tasks, task_idx, sub_tasks)
-            st.session_state.stats["tasks_split"] += len(sub_tasks)
-            task["done"] = True
-            st.session_state.stats["tasks_completed"] += 1
-            st.session_state.task_idx = task_idx + 1
-            reason = "重複頁面" if repeated_page else "分頁視窗上限"
-            msg = f"已分割任務（{reason}）→ {len(sub_tasks)} 個子任務"
-            append_activity(msg, "warning")
-            return {"status": "split", "message": msg, "added_tasks": len(sub_tasks)}
+        split_result = try_split_task(
+            session, tasks, task_idx, task,
+            reason="重複頁面" if repeated_page else "分頁視窗上限",
+            timeout=timeout,
+        )
+        if split_result:
+            return split_result
 
     added = 0
     for hit in hits:
@@ -1387,6 +1420,14 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
         return {"status": "limit", "message": msg, "added": added}
 
     if stop_due_to_max_pages or no_more_hits or natural_end:
+        if should_attempt_split_on_end(task, page_number, hits, page_size):
+            split_result = try_split_task(
+                session, tasks, task_idx, task,
+                reason="API 分頁中斷（可能仍有未抓取商品）",
+                timeout=timeout,
+            )
+            if split_result:
+                return split_result
         task["done"] = True
         st.session_state.stats["tasks_completed"] += 1
         st.session_state.task_idx = task_idx + 1
@@ -1395,16 +1436,13 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
         return {"status": "task_done", "message": msg, "added": added}
 
     if at_window_limit and full_page:
-        sub_tasks = split_oversized_task(session, task, timeout=timeout)
-        if sub_tasks:
-            insert_split_tasks(tasks, task_idx, sub_tasks)
-            st.session_state.stats["tasks_split"] += len(sub_tasks)
-            task["done"] = True
-            st.session_state.stats["tasks_completed"] += 1
-            st.session_state.task_idx = task_idx + 1
-            msg = f"達分頁上限，已分割為 {len(sub_tasks)} 個子任務"
-            append_activity(msg, "warning")
-            return {"status": "split", "message": msg, "added_tasks": len(sub_tasks)}
+        split_result = try_split_task(
+            session, tasks, task_idx, task,
+            reason="分頁視窗上限",
+            timeout=timeout,
+        )
+        if split_result:
+            return split_result
         task["done"] = True
         st.session_state.stats["tasks_completed"] += 1
         st.session_state.task_idx = task_idx + 1
