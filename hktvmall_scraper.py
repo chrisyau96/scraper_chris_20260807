@@ -16,8 +16,8 @@ import time
 import zipfile
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Callable
-from urllib.parse import quote
+from typing import Any, Callable, Iterable
+from urllib.parse import quote, unquote
 
 import pandas as pd
 import requests
@@ -60,6 +60,7 @@ CHECKPOINT_DIR = "hktv_checkpoints"
 BACKUP_DIR = "hktv_backups"
 EXPORT_DIR = "hktv_exports"
 IMAGE_CACHE_DIR = "hktv_image_cache"
+PREVIEW_PAGE_SIZE_OPTIONS = (100, 500, 1000, 5000, 0)  # 0 = show all rows
 
 WEBSITES: dict[str, dict[str, str]] = {
     "hktv_zh": {
@@ -79,52 +80,68 @@ WEBSITES: dict[str, dict[str, str]] = {
 }
 
 EXCEL_COLUMNS: list[str] = [
+    "商品圖片",
+    "商品名稱",
+    "品牌",
+    "現價 (HK$)",
+    "原價 (HK$)",
+    "庫存狀態",
+    "銷量",
+    "評分",
+    "評論數",
+    "商戶",
+    "分類",
+    "分類路徑",
+    "商品編號",
+    "產地",
+    "規格",
+    "商品連結",
+    "抓取時間",
+]
+
+# Internal keys kept in session rows for processing / dedup.
+INTERNAL_ROW_KEYS = (
     "product_code",
-    "base_product",
     "name",
     "brand",
     "selling_price",
-    "selling_price_range",
-    "saved_price",
+    "original_price",
+    "availability",
+    "sales_count",
     "average_rating",
     "number_of_reviews",
-    "in_stock",
-    "stock",
-    "loyalty_point",
-    "number_of_variants",
-    "main_category",
-    "sub_category",
+    "store",
+    "category",
     "category_path",
     "primary_cat_code",
-    "store",
-    "store_code",
     "country_of_origin",
     "packing_spec",
     "summary",
     "image",
     "image_local",
     "product_url",
+    "scraped_at",
     "keyword",
     "task_categories",
     "price_range_filter",
     "brand_filter",
     "source_mode",
-    "source_query",
-    "scraped_at",
-]
+)
 
 SORT_OPTIONS: dict[str, tuple[str, bool] | None] = {
     "預設（抓取順序）": None,
-    "商品編號 A→Z": ("product_code", True),
-    "商品編號 Z→A": ("product_code", False),
-    "價格 低→高": ("selling_price", True),
-    "價格 高→低": ("selling_price", False),
-    "評分 低→高": ("average_rating", True),
-    "評分 高→低": ("average_rating", False),
-    "評論數 少→多": ("number_of_reviews", True),
-    "評論數 多→少": ("number_of_reviews", False),
-    "品牌 A→Z": ("brand", True),
-    "名稱 A→Z": ("name", True),
+    "商品編號 A→Z": ("商品編號", True),
+    "商品編號 Z→A": ("商品編號", False),
+    "現價 低→高": ("現價 (HK$)", True),
+    "現價 高→低": ("現價 (HK$)", False),
+    "銷量 少→多": ("銷量", True),
+    "銷量 多→少": ("銷量", False),
+    "評分 低→高": ("評分", True),
+    "評分 高→低": ("評分", False),
+    "評論數 少→多": ("評論數", True),
+    "評論數 多→少": ("評論數", False),
+    "品牌 A→Z": ("品牌", True),
+    "名稱 A→Z": ("商品名稱", True),
 }
 
 API_SORT_OPTIONS: dict[str, str] = {
@@ -146,8 +163,200 @@ def clean(value: Any) -> str:
         return ""
     if isinstance(value, float) and pd.isna(value):
         return ""
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (dict, list)):
+        return display_text(value)
     text = str(value).strip()
     return re.sub(r"\s+", " ", text)
+
+
+def parse_jsonish(value: Any) -> Any:
+    if isinstance(value, str):
+        raw = value.strip()
+        if (raw.startswith("{") and raw.endswith("}")) or (raw.startswith("[") and raw.endswith("]")):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                try:
+                    return json.loads(unquote(raw))
+                except json.JSONDecodeError:
+                    return value
+    return value
+
+
+def display_fragments(value: Any) -> list[str]:
+    value = parse_jsonish(value)
+    if value is None or isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [clean(value)]
+    if isinstance(value, str):
+        text = clean(unquote(value))
+        return [text] if text else []
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(display_fragments(item))
+        return unique_strings(out)
+    if isinstance(value, dict):
+        for key in (
+            "nameZh", "nameTc", "name", "nameEn", "nameZhCN",
+            "labelZh", "label", "text", "value", "formattedValue", "code",
+        ):
+            if key in value:
+                out = display_fragments(value.get(key))
+                if out:
+                    return out
+        out = []
+        for nested in value.values():
+            out.extend(display_fragments(nested))
+        return unique_strings(out)
+    return [clean(value)] if clean(value) else []
+
+
+def unique_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = clean(value)
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def display_text(value: Any, separator: str = " / ") -> str:
+    return separator.join(unique_strings(display_fragments(value)))
+
+
+def category_text(value: Any) -> str:
+    return display_text(value, separator="; ")
+
+
+def numeric_value(value: Any, *, allow_zero: bool = False) -> int | float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if num < 0:
+            return None
+        if num == 0 and not allow_zero:
+            return None
+        return int(num) if num.is_integer() else num
+    text = clean(value).replace("HK$", "").replace("$", "").replace(",", "").strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    num = float(match.group(0))
+    if num < 0:
+        return None
+    if num == 0 and not allow_zero:
+        return None
+    return int(num) if num.is_integer() else num
+
+
+def price_from_list(rows: Any, wanted_types: set[str] | None = None) -> int | float | None:
+    if not isinstance(rows, list):
+        rows = [rows] if isinstance(rows, dict) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        price_type = clean(row.get("priceType")).upper()
+        if wanted_types and price_type not in wanted_types:
+            continue
+        value = numeric_value(first(row.get("value"), row.get("formattedValue")))
+        if value is not None:
+            return value
+    return None
+
+
+def normalise_availability(value: Any) -> str:
+    if isinstance(value, bool):
+        return "有貨" if value else "缺貨"
+    if isinstance(value, dict):
+        status = value.get("stockLevelStatus")
+        if isinstance(status, dict):
+            code = clean(status.get("code")).casefold()
+            if code in {"instock", "lowstock"}:
+                return "有貨"
+            if code in {"outofstock", "soldout"}:
+                return "缺貨"
+        if value.get("forceInStock"):
+            return "有貨"
+    text = display_text(value).casefold()
+    if any(x in text for x in ("缺貨", "售罄", "outofstock", "soldout", "無貨")):
+        return "缺貨"
+    if any(x in text for x in ("有貨", "instock", "現貨", "available")):
+        return "有貨"
+    return clean(value)
+
+
+def hktv_category_path(source: dict[str, Any]) -> str:
+    raw_items = source.get("categoryStructureDisplay") or []
+    if not isinstance(raw_items, list):
+        raw_items = [raw_items]
+    for raw in raw_items:
+        try:
+            nodes = json.loads(unquote(clean(raw)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(nodes, list):
+            continue
+        names = [
+            category_text(first(node.get("nameZh"), node.get("name"), node.get("nameEn"), node.get("code")))
+            for node in nodes
+            if isinstance(node, dict)
+        ]
+        path = " > ".join(name for name in names if name)
+        if path:
+            return path
+    levels = [
+        category_text(first(source.get("mainCatNameZh"), source.get("mainCatNameEn"))),
+        category_text(source.get("subCat1NameZh")),
+        category_text(source.get("subCat2NameZh")),
+        category_text(source.get("subCat3NameZh")),
+        category_text(source.get("subCat4NameZh")),
+    ]
+    return " > ".join(level for level in levels if level)
+
+
+def extract_brand(source: dict[str, Any]) -> str:
+    for key in ("brandZh", "brandDisplay", "brand", "brandEn"):
+        value = source.get(key)
+        parsed = parse_jsonish(value)
+        text = display_text(parsed) if parsed is not None else clean(value)
+        if text and not text.startswith("{"):
+            return text
+    return ""
+
+
+def row_to_display_record(row: dict[str, Any]) -> dict[str, Any]:
+    current = numeric_value(row.get("selling_price"), allow_zero=True)
+    original = numeric_value(row.get("original_price"), allow_zero=True)
+    sales = numeric_value(row.get("sales_count"), allow_zero=True)
+    rating = numeric_value(row.get("average_rating"), allow_zero=True)
+    reviews = numeric_value(row.get("number_of_reviews"), allow_zero=True)
+    return {
+        "商品圖片": clean(row.get("image")),
+        "商品名稱": clean(row.get("name")),
+        "品牌": clean(row.get("brand")),
+        "現價 (HK$)": current,
+        "原價 (HK$)": original,
+        "庫存狀態": clean(row.get("availability")),
+        "銷量": sales,
+        "評分": rating,
+        "評論數": reviews,
+        "商戶": clean(row.get("store")),
+        "分類": clean(row.get("category")),
+        "分類路徑": clean(row.get("category_path")),
+        "商品編號": clean(row.get("product_code")),
+        "產地": clean(row.get("country_of_origin")),
+        "規格": clean(row.get("packing_spec")),
+        "商品連結": clean(row.get("product_url")),
+        "抓取時間": clean(row.get("scraped_at")),
+        "_image_local": clean(row.get("image_local")),
+    }
 
 
 def first(*values: Any) -> Any:
@@ -171,10 +380,6 @@ def unique(seq: list[Any]) -> list[Any]:
         seen.add(item)
         out.append(item)
     return out
-
-
-def display_fragments(parts: list[Any]) -> str:
-    return " / ".join(clean(p) for p in parts if clean(p))
 
 
 def now_iso() -> str:
@@ -722,47 +927,56 @@ def parse_hktv_hit(
     src = hit.get("source") or hit
     cfg = WEBSITES.get(site_key, WEBSITES["hktv_zh"])
     code = clean(src.get("code") or src.get("productSearchCode"))
-    name = first(src.get("nameZh"), src.get("nameEn"), src.get("nameZhCN"))
-    brand = first(src.get("brandDisplay"), src.get("brandZh"), src.get("brand"), src.get("brandEn"))
+    name = first(src.get("nameZh"), src.get("nameEn"), src.get("nameZhCN"), src.get("name"))
+    brand = extract_brand(src)
+    breadcrumb = hktv_category_path(src)
+    category = category_text(first(src.get("catNameZh"), breadcrumb.split(" > ")[-1] if breadcrumb else ""))
+    current_price = numeric_value(
+        first(src.get("sellingPrice"), src.get("currentPrice"), src.get("discountPrice"))
+    )
+    original_price = numeric_value(
+        first(src.get("basePrice"), src.get("listPrice"), src.get("originalPrice"), src.get("regularPrice"))
+    )
+    if original_price is None:
+        original_price = price_from_list(src.get("savedPrice"), {"BUY", "BASE", "LIST", "ORIGINAL", "REGULAR"})
+    if original_price is None:
+        original_price = price_from_list(src.get("priceList"), {"BUY", "BASE", "LIST", "ORIGINAL", "REGULAR"})
     image = first(
         src.get("imageLink"),
+        src.get("imageUrl"),
+        src.get("thumbnailUrl"),
         (src.get("images") or [None])[0] if isinstance(src.get("images"), list) else None,
         (src.get("gallery") or [None])[0] if isinstance(src.get("gallery"), list) else None,
     )
-    category_path = display_fragments(
-        [
-            first(src.get("mainCatNameZh"), src.get("mainCatNameEn")),
-            src.get("subCat1NameZh"),
-            src.get("subCat2NameZh"),
-            src.get("subCat3NameZh"),
-            src.get("subCat4NameZh"),
-        ]
-    )
-    product_url = first(src.get("urlZh"), src.get("urlEn"))
+    if isinstance(image, dict):
+        image = first(image.get("url"), image.get("imageUrl"))
+    product_url = first(src.get("urlZh"), src.get("urlEn"), src.get("url"))
+    if product_url:
+        product_url = clean(product_url)
+        if product_url.startswith("//"):
+            product_url = "https:" + product_url
+        elif product_url.startswith("/"):
+            product_url = "https://www.hktvmall.com" + product_url
+        elif product_url.startswith("main/"):
+            product_url = f"https://www.hktvmall.com/hktv/zh/{product_url}"
     if not product_url and code:
         product_url = cfg["product_url_base"] + code
 
     row: dict[str, Any] = {
         "product_code": code,
-        "base_product": clean(src.get("baseProduct")),
         "name": clean(name),
-        "brand": clean(brand),
-        "selling_price": src.get("sellingPrice"),
-        "selling_price_range": clean(src.get("sellingPriceRange")),
-        "saved_price": src.get("savedPrice"),
-        "average_rating": src.get("averageRating"),
-        "number_of_reviews": src.get("numberOfReviews"),
-        "in_stock": src.get("hasStock"),
-        "stock": clean(src.get("stock")),
-        "loyalty_point": src.get("loyaltyPoint"),
-        "number_of_variants": src.get("numberOfVariants"),
-        "main_category": clean(first(src.get("mainCatNameZh"), src.get("mainCatNameEn"))),
-        "sub_category": clean(first(src.get("subCat1NameZh"), src.get("subCat1NameEn"))),
-        "category_path": category_path,
+        "brand": brand,
+        "selling_price": current_price,
+        "original_price": original_price,
+        "availability": normalise_availability(first(src.get("hasStock"), src.get("stock"))),
+        "sales_count": numeric_value(first(src.get("salesVolume"), src.get("soldCount")), allow_zero=True),
+        "average_rating": numeric_value(first(src.get("averageRating"), src.get("rating")), allow_zero=True),
+        "number_of_reviews": numeric_value(first(src.get("numberOfReviews"), src.get("reviewCount")), allow_zero=True),
+        "store": clean(first(src.get("storeNameZh"), src.get("storeDisplay"), src.get("storeName"), src.get("store"))),
+        "category": category,
+        "category_path": breadcrumb or category,
         "primary_cat_code": clean(src.get("primaryCatCode")),
-        "store": clean(first(src.get("storeNameZh"), src.get("storeDisplay"), src.get("store"))),
-        "store_code": clean(src.get("storeCode")),
-        "country_of_origin": clean(
+        "country_of_origin": display_text(
             first(src.get("countryOfOriginDisplay"), src.get("countryOfOriginZh"), src.get("countryOfOrigin"))
         ),
         "packing_spec": clean(first(src.get("packingSpecZh"), src.get("packingSpecEn"))),
@@ -775,21 +989,30 @@ def parse_hktv_hit(
         "price_range_filter": clean(task.get("price_range")),
         "brand_filter": clean(task.get("brand")),
         "source_mode": clean(task.get("mode") or task.get("method")),
-        "source_query": clean(task.get("keyword") or ",".join(task.get("categories") or [])),
         "scraped_at": now_iso(),
     }
 
     if use_pdp_fallback and session and code:
-        missing = [
-            k
-            for k in ("name", "brand", "selling_price", "average_rating", "summary", "image")
-            if not row.get(k)
-        ]
+        missing = [k for k in ("name", "brand", "selling_price", "image") if not row.get(k)]
         if missing:
             fallback = hktv_pdp_fallback_fields(session, code, site_key=site_key)
             for key, value in fallback.items():
-                if not row.get(key):
-                    row[key] = value
+                mapped = {
+                    "name": "name",
+                    "brand": "brand",
+                    "selling_price": "selling_price",
+                    "average_rating": "average_rating",
+                    "number_of_reviews": "number_of_reviews",
+                    "summary": "summary",
+                    "image": "image",
+                    "category_path": "category_path",
+                    "main_category": "category",
+                }.get(key, key)
+                if not row.get(mapped):
+                    if key == "in_stock":
+                        row["availability"] = normalise_availability(value)
+                    elif mapped in row:
+                        row[mapped] = value
     return row
 
 
@@ -830,7 +1053,8 @@ def cache_product_image(session: requests.Session, row: dict, timeout: float = 2
 def rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=EXCEL_COLUMNS)
-    df = pd.DataFrame(rows)
+    records = [row_to_display_record(row) for row in rows]
+    df = pd.DataFrame(records)
     for col in EXCEL_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -845,7 +1069,7 @@ def sort_dataframe(df: pd.DataFrame, sort_key: str) -> pd.DataFrame:
     if col not in df.columns:
         return df
     work = df.copy()
-    if col in {"selling_price", "average_rating", "number_of_reviews"}:
+    if col in {"現價 (HK$)", "原價 (HK$)", "評分", "評論數", "銷量"}:
         work[col] = pd.to_numeric(work[col], errors="coerce")
     return work.sort_values(by=col, ascending=ascending, kind="mergesort", na_position="last")
 
@@ -857,6 +1081,7 @@ def build_excel_with_images(
     embed_images: bool = True,
     image_row_height: int = 80,
     timeout: float = 20.0,
+    source_rows: list[dict] | None = None,
 ) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -870,10 +1095,13 @@ def build_excel_with_images(
                 cell.alignment = Alignment(vertical="center", wrap_text=True)
 
     image_col_idx = None
-    if "image_local" in df.columns:
-        image_col_idx = df.columns.get_loc("image_local") + 1
-    elif "image" in df.columns:
-        image_col_idx = df.columns.get_loc("image") + 1
+    if "_image_local" in df.columns:
+        image_col_idx = df.columns.get_loc("_image_local") + 1
+    elif "商品圖片" in df.columns:
+        image_col_idx = df.columns.get_loc("商品圖片") + 1
+
+    export_rows = source_rows or []
+    row_lookup = {clean(r.get("product_code")): r for r in export_rows}
 
     for idx, record in enumerate(df.to_dict(orient="records"), start=2):
         ws.row_dimensions[idx].height = image_row_height
@@ -881,9 +1109,11 @@ def build_excel_with_images(
             ws.cell(row=idx, column=col_idx).alignment = Alignment(vertical="top", wrap_text=True)
         if not embed_images or image_col_idx is None:
             continue
-        local_path = clean(record.get("image_local"))
+        code = clean(record.get("商品編號"))
+        source_row = row_lookup.get(code, {})
+        local_path = clean(record.get("_image_local") or source_row.get("image_local"))
         if not local_path:
-            local_path = cache_product_image(session, record, timeout=timeout)
+            local_path = cache_product_image(session, source_row or record, timeout=timeout)
         if not local_path or not os.path.exists(local_path):
             continue
         try:
@@ -932,6 +1162,7 @@ def build_export_package(
         session,
         embed_images=embed_images_in_excel and include_images,
         timeout=timeout,
+        source_rows=rows,
     )
     csv_bytes = df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
     manifest = {
@@ -1001,7 +1232,7 @@ def save_backup(rows: list[dict], label: str | None = None) -> str | None:
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
     session = get_session()
     with open(xlsx_path, "wb") as fh:
-        fh.write(build_excel_with_images(df, session, embed_images=False))
+        fh.write(build_excel_with_images(df, session, embed_images=False, source_rows=rows))
     return csv_path
 
 
@@ -1623,16 +1854,55 @@ def render_preview(cfg: dict) -> None:
     )
     st.session_state.preview_sort = sort_key
     df = sort_dataframe(rows_to_dataframe(rows), sort_key)
+    total = len(df)
 
-    st.subheader("資料預覽")
-    st.caption(f"共 {len(df)} 筆（顯示前 200 筆）")
-    st.dataframe(df.head(200), use_container_width=True)
+    page_size = st.selectbox(
+        "預覽每頁筆數（0 = 顯示全部）",
+        options=list(PREVIEW_PAGE_SIZE_OPTIONS),
+        index=1,
+        format_func=lambda n: "全部" if n == 0 else str(n),
+        key="preview_page_size_select",
+    )
+    page_count = 1 if page_size == 0 else max(1, (total + page_size - 1) // page_size)
+    page_no = st.number_input(
+        "預覽頁碼",
+        min_value=1,
+        max_value=page_count,
+        value=1,
+        step=1,
+        key="preview_page_no",
+    ) if page_size > 0 else 1
+
+    if page_size > 0:
+        start = (page_no - 1) * page_size
+        view_df = df.iloc[start : start + page_size]
+        st.subheader("資料預覽")
+        st.caption(f"共 {total:,} 筆｜顯示第 {start + 1:,}–{min(start + page_size, total):,} 筆（下載檔案包含全部 {total:,} 筆）")
+    else:
+        view_df = df
+        st.subheader("資料預覽")
+        st.caption(f"共 {total:,} 筆（已全部顯示；下載檔案同樣包含全部資料）")
+
+    st.dataframe(
+        view_df,
+        use_container_width=True,
+        height=min(700, max(300, 35 * min(len(view_df) + 1, 25))),
+        column_config={
+            "商品圖片": st.column_config.ImageColumn("商品圖片", width="small"),
+            "商品連結": st.column_config.LinkColumn("商品連結", display_text="開啟商品"),
+            "現價 (HK$)": st.column_config.NumberColumn("現價 (HK$)", format="HK$%d"),
+            "原價 (HK$)": st.column_config.NumberColumn("原價 (HK$)", format="HK$%d"),
+            "銷量": st.column_config.NumberColumn("銷量", format="%d"),
+            "評分": st.column_config.NumberColumn("評分", format="%.1f"),
+            "評論數": st.column_config.NumberColumn("評論數", format="%d"),
+        },
+    )
 
     session = get_session()
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.download_button(
-            "下載 CSV",
+            f"下載 CSV（全部 {total:,} 筆）",
             data=df.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
@@ -1640,12 +1910,13 @@ def render_preview(cfg: dict) -> None:
         )
     with c2:
         st.download_button(
-            "下載 Excel",
+            f"下載 Excel（全部 {total:,} 筆）",
             data=build_excel_with_images(
                 df,
                 session,
                 embed_images=cfg.get("embed_images_in_excel", True) and cfg.get("include_images", True),
                 timeout=cfg.get("timeout", 30),
+                source_rows=rows,
             ),
             file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
