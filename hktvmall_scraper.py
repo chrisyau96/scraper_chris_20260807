@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.2-locale-from-url"
+APP_VERSION = "1.6.3-export-columns"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -95,7 +95,6 @@ EXCEL_COLUMNS: list[str] = [
     "Breadcrumb",
     "Product Code",
     "Origin",
-    "Pack Size",
     "Product URL",
     "Scraped At",
 ]
@@ -473,7 +472,6 @@ def row_to_display_record(row: dict[str, Any]) -> dict[str, Any]:
         "Breadcrumb": scalar_text(row.get("category_path")),
         "Product Code": scalar_text(row.get("product_code")),
         "Origin": scalar_text(row.get("country_of_origin")),
-        "Pack Size": scalar_text(row.get("packing_spec")),
         "Product URL": scalar_text(row.get("product_url")),
         "Scraped At": scalar_text(row.get("scraped_at")),
         "_image_local": scalar_text(row.get("image_local")),
@@ -2099,8 +2097,24 @@ def render_preview(cfg: dict) -> None:
     export_df = full_df[EXCEL_COLUMNS]
     session = get_session()
     with st.expander(f"Download exports ({total:,} rows)", expanded=False):
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
+            st.download_button(
+                f"Download Excel with product images ({total:,} rows)",
+                data=build_excel_with_images(
+                    full_df,
+                    session,
+                    embed_images=True,
+                    timeout=cfg.get("timeout", 30),
+                    source_rows=rows,
+                ),
+                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+            st.caption("Excel file with product thumbnails embedded in the Product Image column.")
+        with c2:
             st.download_button(
                 f"Download CSV ({total:,} rows)",
                 data=export_df.to_csv(index=False).encode("utf-8-sig"),
@@ -2108,35 +2122,7 @@ def render_preview(cfg: dict) -> None:
                 mime="text/csv",
                 use_container_width=True,
             )
-        with c2:
-            st.download_button(
-                f"Download Excel ({total:,} rows)",
-                data=build_excel_with_images(
-                    full_df,
-                    session,
-                    embed_images=cfg.get("embed_images_in_excel", True),
-                    timeout=cfg.get("timeout", 30),
-                    source_rows=rows,
-                ),
-                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with c3:
-            zip_bytes, zip_name = build_export_package(
-                st.session_state.rows,
-                session,
-                include_images=cfg.get("include_images", True),
-                embed_images_in_excel=cfg.get("embed_images_in_excel", True),
-                timeout=cfg.get("timeout", 30),
-            )
-            st.download_button(
-                f"Download ZIP ({total:,} rows + images)",
-                data=zip_bytes,
-                file_name=zip_name,
-                mime="application/zip",
-                use_container_width=True,
-            )
+            st.caption("Lightweight spreadsheet export (image URLs only, no embedded thumbnails).")
 
 
 def render_main() -> None:
