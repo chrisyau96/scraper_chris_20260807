@@ -88,6 +88,32 @@ def test_api_max_page_number() -> None:
     print("OK api_max_page_number")
 
 
+def test_excel_export_clean_cells() -> None:
+    session = scraper.build_session()
+    result = scraper.hktv_fetch_page(
+        session,
+        categories=["AA32080500000"],
+        page_number=0,
+        page_size=15,
+        sort_by="salesVolume:desc",
+        timeout=30,
+    )
+    rows = [
+        scraper.parse_hktv_hit(h, task=scraper.new_task(method="category", categories=["AA32080500000"]))
+        for h in result.get("hits", [])
+    ]
+    assert rows, "expected sample rows"
+    df = scraper.rows_to_dataframe(rows)
+    for col in scraper.EXCEL_COLUMNS:
+        for val in df[col].tolist():
+            text = str(val)
+            assert not text.startswith("[{"), f"{col} has JSON blob: {text[:80]}"
+            assert not text.startswith('{"'), f"{col} has JSON blob: {text[:80]}"
+    excel_bytes = scraper.build_excel_with_images(df, session, embed_images=False, source_rows=rows)
+    assert len(excel_bytes) > 1000
+    print(f"OK excel export: {len(rows)} rows, {len(excel_bytes)} bytes")
+
+
 def main() -> int:
     tests = [
         test_api_max_page_number,
@@ -96,6 +122,7 @@ def main() -> int:
         test_discover_child_codes,
         test_price_range_filter,
         test_split_task_produces_subtasks,
+        test_excel_export_clean_cells,
     ]
     for test in tests:
         print(f"\n--- {test.__name__} ---")
