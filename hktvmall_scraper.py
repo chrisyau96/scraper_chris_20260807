@@ -1266,7 +1266,7 @@ def build_excel_with_images(
     for col_idx, col_name in enumerate(export_cols, start=1):
         sample = export_df[col_name].head(200).astype(str).tolist() if not export_df.empty else []
         values = [str(col_name)] + sample
-        width = min(max(len(v) for v in values) + 2, 55)
+        width = min(max(len(f"{v}") for v in values) + 2, 55)
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     buffer = io.BytesIO()
