@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.5.1-webapp-en"
+APP_VERSION = "1.6.0-category-breakdown"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -271,20 +271,63 @@ def category_text(value: Any) -> str:
     return display_text(value, separator="; ")
 
 
-def extract_category_code_from_input(raw: str) -> str:
-    """Extract an HKTVmall category code from a pasted URL or plain code."""
-    text = scalar_text(raw)
+def extract_category_slug_from_url(raw: str) -> str:
+    """Extract a top-level category slug from an HKTVmall browse URL."""
+    text = scalar_text(raw).strip()
+    if not text:
+        return ""
+    match = re.search(r"hktvmall\.com/hktv/(?:zh|en)/([^/?#]+)", text, flags=re.I)
+    if match:
+        return match.group(1).lower()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", text) and not text.upper().startswith("AA"):
+        return text.lower()
+    return ""
+
+
+def extract_aa_category_code(raw: str) -> str:
+    """Extract an HKTVmall AA category code from pasted text."""
+    text = scalar_text(raw).strip()
     if not text:
         return ""
     match = re.search(r"(AA\d{11,})", text, flags=re.I)
     if match:
         return match.group(1).upper()
-    match = re.search(r"/category/([A-Za-z0-9_-]+)", text, flags=re.I)
-    if match:
-        code = match.group(1)
-        if code.upper().startswith("AA"):
-            return code.upper()
-    return text
+    if re.fullmatch(r"AA\d{11,}", text, flags=re.I):
+        return text.upper()
+    return ""
+
+
+def extract_category_code_from_input(raw: str) -> str:
+    """Backward-compatible helper: prefer AA code, else slug from URL."""
+    return extract_aa_category_code(raw) or extract_category_slug_from_url(raw)
+
+
+def resolve_category_roots(cfg: dict) -> list[str]:
+    """Combine category URLs (slugs) and AA codes into unique scrape roots."""
+    roots: list[str] = []
+    for raw in cfg.get("category_urls", []) or []:
+        slug = extract_category_slug_from_url(raw)
+        if slug:
+            roots.append(slug)
+    for raw in cfg.get("category_codes", []) or []:
+        code = extract_aa_category_code(raw)
+        if code:
+            roots.append(code)
+    # Legacy single-field support
+    for raw in cfg.get("category_codes_legacy", []) or []:
+        slug = extract_category_slug_from_url(raw)
+        code = extract_aa_category_code(raw)
+        if slug:
+            roots.append(slug)
+        elif code:
+            roots.append(code)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for root in roots:
+        if root not in seen:
+            seen.add(root)
+            ordered.append(root)
+    return ordered
 
 
 def numeric_value(value: Any, *, allow_zero: bool = False) -> int | float | None:
@@ -783,6 +826,28 @@ def discover_child_category_codes(
     keyword: str = "",
     extra_filter: dict | None = None,
 ) -> list[dict[str, str]]:
+    """Discover child category codes under a parent (fast agg, then sampled fallback)."""
+    base_filter = merge_filters({"category": [parent_code]}, extra_filter)
+    result = hktv_search_request(
+        session,
+        keyword=keyword,
+        page_number=0,
+        page_size=1,
+        filter_obj=base_filter,
+        aggregations=["primaryCatCode"],
+        timeout=timeout,
+    )
+    agg = result.get("aggregations", {}).get("primaryCatCode") or {}
+    if isinstance(agg, dict) and agg:
+        children = [
+            {"code": clean(code), "name": clean(code), "count": int(count)}
+            for code, count in agg.items()
+            if clean(code) and clean(code) != parent_code
+        ]
+        if children:
+            children.sort(key=lambda item: (-item.get("count", 0), item["code"]))
+            return [{"code": item["code"], "name": item["name"]} for item in children]
+
     discovered: dict[str, str] = {}
 
     def collect_from_hits(hits: list[dict]) -> None:
@@ -803,53 +868,16 @@ def discover_child_category_codes(
                 )
             discovered[code] = clean(name) or code
 
-    base_filter = merge_filters({"category": [parent_code]}, extra_filter)
-
     first_page = hktv_search_request(
         session,
         keyword=keyword,
         page_number=0,
         page_size=DEFAULT_PAGE_SIZE,
         filter_obj=base_filter,
-        aggregations=["category", "brand"],
+        aggregations=["primaryCatCode"],
         timeout=timeout,
     )
     collect_from_hits(first_page.get("hits") or [])
-
-    top_brands = fetch_brand_facets(
-        session,
-        keyword=keyword,
-        categories=[parent_code],
-        extra_filter=extra_filter,
-        limit=8,
-        timeout=timeout,
-    )
-
-    for bucket in DEFAULT_PRICE_RANGE_BUCKETS:
-        bucket_filter = merge_filters(base_filter, {"priceRange": [bucket]})
-        sampled = hktv_search_request(
-            session,
-            keyword=keyword,
-            page_number=0,
-            page_size=DEFAULT_PAGE_SIZE,
-            filter_obj=bucket_filter,
-            aggregations=["category", "brand"],
-            timeout=timeout,
-        )
-        collect_from_hits(sampled.get("hits") or [])
-
-    for brand in top_brands:
-        brand_filter = merge_filters(base_filter, {"brand": [brand]})
-        sampled = hktv_search_request(
-            session,
-            keyword=keyword,
-            page_number=0,
-            page_size=DEFAULT_PAGE_SIZE,
-            filter_obj=brand_filter,
-            aggregations=["category", "brand"],
-            timeout=timeout,
-        )
-        collect_from_hits(sampled.get("hits") or [])
 
     children = [{"code": code, "name": name} for code, name in discovered.items() if code != parent_code]
     children.sort(key=lambda item: item["code"])
@@ -1420,6 +1448,38 @@ def split_oversized_task(
     return []
 
 
+def build_category_breakdown_tasks(
+    session: requests.Session,
+    roots: list[str],
+    *,
+    timeout: float = 30.0,
+    auto_breakdown: bool = True,
+) -> list[dict]:
+    """Turn category roots into leaf scrape tasks by auto-discovering sub-categories."""
+    tasks: list[dict] = []
+    for root in roots:
+        if auto_breakdown:
+            children = discover_child_category_codes(session, root, timeout=timeout)
+            if children:
+                for child in children:
+                    tasks.append(
+                        new_task(
+                            method="category",
+                            categories=[child["code"]],
+                            label=f"Category: {root} > {child['code']}",
+                        )
+                    )
+                continue
+        tasks.append(
+            new_task(
+                method="category",
+                categories=[root],
+                label=f"Category: {root}",
+            )
+        )
+    return tasks
+
+
 def expand_subcategory_tasks(
     session: requests.Session,
     tasks: list[dict],
@@ -1466,47 +1526,58 @@ def build_tasks(cfg: dict, session: requests.Session | None = None) -> list[dict
     tasks: list[dict] = []
 
     keywords = [clean(k) for k in cfg.get("keywords", []) if clean(k)]
-    category_codes = [clean(c) for c in cfg.get("category_codes", []) if clean(c)]
-    expand_subcats = bool(cfg.get("expand_subcategories", False))
-
-    category_codes = [
-        extract_category_code_from_input(code)
-        for code in category_codes
-        if extract_category_code_from_input(code)
-    ]
+    category_roots = resolve_category_roots(cfg)
+    auto_breakdown = bool(cfg.get("auto_breakdown_categories", True))
 
     if method == "keyword":
         for kw in keywords:
             tasks.append(new_task(method="keyword", keyword=kw, label=f"Keyword: {kw}"))
 
     elif method == "category":
-        for code in category_codes:
-            base = new_task(method="category", categories=[code], label=f"Category: {code}")
-            if expand_subcats:
-                tasks.extend(expand_subcategory_tasks(session, [base], timeout=timeout))
-            else:
-                tasks.append(base)
+        if not category_roots:
+            return []
+        tasks.extend(
+            build_category_breakdown_tasks(
+                session,
+                category_roots,
+                timeout=timeout,
+                auto_breakdown=auto_breakdown,
+            )
+        )
 
     elif method == "both":
-        if not keywords and not category_codes:
+        if not keywords and not category_roots:
             return []
-        if keywords and category_codes:
-            for code in category_codes:
-                for kw in keywords:
-                    tasks.append(
-                        new_task(
-                            method="both",
-                            categories=[code],
-                            keyword=kw,
-                            label=f"Category: {code} + Keyword: {kw}",
+        if keywords and category_roots:
+            for root in category_roots:
+                sub_tasks = build_category_breakdown_tasks(
+                    session,
+                    [root],
+                    timeout=timeout,
+                    auto_breakdown=auto_breakdown,
+                )
+                for sub in sub_tasks:
+                    for kw in keywords:
+                        tasks.append(
+                            new_task(
+                                method="both",
+                                categories=list(sub.get("categories") or []),
+                                keyword=kw,
+                                label=f"{sub.get('label', root)} + Keyword: {kw}",
+                            )
                         )
-                    )
         elif keywords:
             for kw in keywords:
                 tasks.append(new_task(method="keyword", keyword=kw, label=f"Keyword: {kw}"))
         else:
-            for code in category_codes:
-                tasks.append(new_task(method="category", categories=[code], label=f"Category: {code}"))
+            tasks.extend(
+                build_category_breakdown_tasks(
+                    session,
+                    category_roots,
+                    timeout=timeout,
+                    auto_breakdown=auto_breakdown,
+                )
+            )
 
     elif method == "all":
         top_cats = fetch_top_level_categories(session, timeout=timeout)
@@ -1812,32 +1883,45 @@ def render_sidebar() -> dict:
         options=["keyword", "category", "both", "all"],
         format_func=lambda x: {
             "keyword": "Keyword",
-            "category": "Category code / URL",
+            "category": "Category (URL or code)",
             "both": "Category + keyword",
             "all": "All products (top-level categories)",
         }[x],
     )
 
     keywords: list[str] = []
+    category_urls: list[str] = []
     category_codes: list[str] = []
-    expand_subcategories = False
 
     if method in {"keyword", "both"}:
         raw_kw = st.sidebar.text_area("Keywords (one per line)", value="", height=90)
         keywords = [scalar_text(x) for x in raw_kw.splitlines() if scalar_text(x)]
 
     if method in {"category", "both"}:
-        raw_cat = st.sidebar.text_area(
-            "Category codes or HKTVmall URLs (one per line)",
+        raw_urls = st.sidebar.text_area(
+            "Category URLs (one per line)",
             value="",
             height=90,
+            placeholder=(
+                "https://www.hktvmall.com/hktv/zh/pets\n"
+                "https://www.hktvmall.com/hktv/zh/mothernbaby"
+            ),
+            help="Paste HKTVmall browse URLs. The slug (e.g. pets, mothernbaby) is extracted automatically.",
         )
-        category_codes = [
-            extract_category_code_from_input(x)
-            for x in raw_cat.splitlines()
-            if extract_category_code_from_input(x)
-        ]
-        expand_subcategories = st.sidebar.checkbox("Auto-expand sub-categories", value=True)
+        category_urls = [scalar_text(x) for x in raw_urls.splitlines() if scalar_text(x)]
+
+        raw_codes = st.sidebar.text_area(
+            "Category codes (one per line)",
+            value="",
+            height=90,
+            placeholder="AA11850000000\nAA11800000000",
+            help="Paste AA category codes directly (14-digit codes starting with AA).",
+        )
+        category_codes = [scalar_text(x) for x in raw_codes.splitlines() if scalar_text(x)]
+
+        st.sidebar.caption(
+            "Sub-categories are discovered automatically via the API and turned into separate scrape tasks."
+        )
 
     sort_label = st.sidebar.selectbox(
         "Sort results by",
@@ -1857,8 +1941,9 @@ def render_sidebar() -> dict:
     return {
         "method": method,
         "keywords": keywords,
+        "category_urls": category_urls,
         "category_codes": category_codes,
-        "expand_subcategories": expand_subcategories,
+        "auto_breakdown_categories": True,
         "page_size": DEFAULT_PAGE_SIZE,
         "max_pages": 0,
         "limit": int(limit),
