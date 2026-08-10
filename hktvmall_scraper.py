@@ -2193,6 +2193,10 @@ def render_main() -> None:
     if st.session_state.last_message:
         st.caption(st.session_state.last_message)
 
+    render_preview(cfg)
+    render_activity_log()
+    render_task_queue()
+
     if st.session_state.auto_run:
         active_cfg = st.session_state.get("settings") or cfg
         for _ in range(max(1, active_cfg.get("steps_per_loop", 1))):
@@ -2210,10 +2214,6 @@ def render_main() -> None:
         if delay > 0:
             time.sleep(delay)
         st.rerun()
-
-    render_preview(cfg)
-    render_activity_log()
-    render_task_queue()
 
 
 def main() -> None:
