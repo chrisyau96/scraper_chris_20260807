@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.3-export-columns"
+APP_VERSION = "1.6.4-download-fix"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -2056,6 +2056,93 @@ def render_running_styles() -> None:
     )
 
 
+def export_rows_fingerprint(rows: list[dict]) -> str:
+    """Stable key for caching export files for the current scrape result."""
+    if not rows:
+        return "empty"
+    payload = {
+        "count": len(rows),
+        "first": clean(rows[0].get("product_code")),
+        "last": clean(rows[-1].get("product_code")),
+        "last_scraped": clean(rows[-1].get("scraped_at")),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+@st.cache_data(show_spinner=False, max_entries=5)
+def cached_excel_export_bytes(fingerprint: str, rows_json: str, timeout: float) -> bytes:
+    rows = json.loads(rows_json)
+    df = rows_to_dataframe(rows)
+    session = build_session()
+    try:
+        return build_excel_with_images(
+            df,
+            session,
+            embed_images=True,
+            timeout=timeout,
+            source_rows=rows,
+        )
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def render_download_exports(cfg: dict, rows: list[dict], total: int) -> None:
+    """Show CSV and Excel download buttons (always visible, not inside a collapsed panel)."""
+    st.subheader(f"Download exports ({total:,} rows)")
+    export_df = rows_to_dataframe(rows)[EXCEL_COLUMNS]
+
+    col_csv, col_excel = st.columns(2)
+
+    with col_csv:
+        st.download_button(
+            f"Download CSV ({total:,} rows)",
+            data=export_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"download_csv_{total}",
+        )
+        st.caption("All product data as CSV (image URLs in the Product Image column).")
+
+    with col_excel:
+        fingerprint = export_rows_fingerprint(rows)
+        session_key = f"excel_bytes_{fingerprint}"
+        error_key = f"excel_error_{fingerprint}"
+        excel_bytes = st.session_state.get(session_key)
+
+        if excel_bytes is None and error_key not in st.session_state:
+            with st.spinner(f"Building Excel with embedded images ({total:,} rows)…"):
+                try:
+                    excel_bytes = cached_excel_export_bytes(
+                        fingerprint,
+                        json.dumps(rows, default=str),
+                        float(cfg.get("timeout", 30)),
+                    )
+                    st.session_state[session_key] = excel_bytes
+                except Exception as exc:
+                    st.session_state[error_key] = str(exc)
+
+        if error_key in st.session_state:
+            st.error(f"Excel export failed: {st.session_state[error_key]}")
+
+        excel_bytes = st.session_state.get(session_key)
+        if excel_bytes:
+            st.download_button(
+                f"Download Excel with images ({total:,} rows)",
+                data=excel_bytes,
+                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_excel_{fingerprint}",
+            )
+            st.caption("Excel file with product thumbnails embedded in the Product Image column.")
+        elif error_key not in st.session_state:
+            st.info("Preparing Excel export…")
+
+
 def render_preview(cfg: dict) -> None:
     rows = st.session_state.rows
     if not rows:
@@ -2090,39 +2177,10 @@ def render_preview(cfg: dict) -> None:
     )
 
     if st.session_state.auto_run:
-        st.caption("⏸ Pause scraping to generate download files (skipped while running to save resources).")
+        st.caption("⏸ Pause scraping to enable downloads.")
         return
 
-    full_df = rows_to_dataframe(rows)
-    export_df = full_df[EXCEL_COLUMNS]
-    session = get_session()
-    with st.expander(f"Download exports ({total:,} rows)", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                f"Download Excel with product images ({total:,} rows)",
-                data=build_excel_with_images(
-                    full_df,
-                    session,
-                    embed_images=True,
-                    timeout=cfg.get("timeout", 30),
-                    source_rows=rows,
-                ),
-                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
-            )
-            st.caption("Excel file with product thumbnails embedded in the Product Image column.")
-        with c2:
-            st.download_button(
-                f"Download CSV ({total:,} rows)",
-                data=export_df.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.caption("Lightweight spreadsheet export (image URLs only, no embedded thumbnails).")
+    render_download_exports(cfg, rows, total)
 
 
 def render_main() -> None:
