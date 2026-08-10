@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.1-ui-controls"
+APP_VERSION = "1.6.2-locale-from-url"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -269,6 +269,35 @@ def display_text(value: Any, separator: str = " / ") -> str:
 
 def category_text(value: Any) -> str:
     return display_text(value, separator="; ")
+
+
+def extract_locale_from_hktv_url(raw: str) -> str | None:
+    """Return 'zh' or 'en' from an HKTVmall browse/product URL."""
+    text = scalar_text(raw).strip()
+    if not text:
+        return None
+    match = re.search(r"hktvmall\.com/hktv/(zh|en)/", text, flags=re.I)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def resolve_website_key(cfg: dict) -> str:
+    """Pick product language from category URLs (/zh/ → Chinese, /en/ → English)."""
+    locales: list[str] = []
+    for raw in cfg.get("category_urls", []) or []:
+        locale = extract_locale_from_hktv_url(raw)
+        if locale:
+            locales.append(locale)
+    if locales:
+        if any(locale == "zh" for locale in locales):
+            return "hktv_zh"
+        if any(locale == "en" for locale in locales):
+            return "hktv_en"
+    explicit = clean(cfg.get("website_key"))
+    if explicit in WEBSITES:
+        return explicit
+    return "hktv_zh"
 
 
 def extract_category_slug_from_url(raw: str) -> str:
@@ -522,8 +551,8 @@ def append_activity(message: str, level: str = "info") -> None:
 
 
 def website_cfg(site_key: str | None = None) -> dict[str, str]:
-    key = site_key or st.session_state.get("website_key", "hktv_en")
-    return WEBSITES.get(key, WEBSITES["hktv_en"])
+    key = site_key or st.session_state.get("website_key", "hktv_zh")
+    return WEBSITES.get(key, WEBSITES["hktv_zh"])
 
 
 # =============================================================================
@@ -1317,7 +1346,7 @@ def save_checkpoint(state: dict, label: str = "latest") -> str:
         "stats": state.get("stats", {}),
         "settings": state.get("settings", {}),
         "activity_log": state.get("activity_log", [])[-200:],
-        "website_key": state.get("website_key", "hktv_en"),
+        "website_key": state.get("website_key", "hktv_zh"),
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(serializable, fh, ensure_ascii=False, indent=2)
@@ -1605,7 +1634,7 @@ def init_state() -> None:
         "app_version": APP_VERSION,
         "initialized": True,
         "http_session": None,
-        "website_key": "hktv_en",
+        "website_key": "hktv_zh",
         "running": False,
         "auto_run": False,
         "tasks": [],
@@ -1640,7 +1669,7 @@ def init_state() -> None:
 
 def reset_run_state(keep_settings: bool = True) -> None:
     settings = deepcopy(st.session_state.get("settings", {}))
-    website_key = st.session_state.get("website_key", "hktv_en")
+    website_key = st.session_state.get("website_key", "hktv_zh")
     preview_sort = st.session_state.get("preview_sort", "Default (scrape order)")
     close_session()
     st.session_state.tasks = []
@@ -1730,7 +1759,7 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
     brand = task.get("brand")
     extra_filter = build_task_extra_filter(task)
     use_pdp_fallback = bool(cfg.get("use_pdp_fallback", False))
-    site_key = cfg.get("website_key", st.session_state.get("website_key", "hktv_en"))
+    site_key = cfg.get("website_key", st.session_state.get("website_key", "hktv_zh"))
 
     try:
         result = hktv_fetch_page(
@@ -1922,6 +1951,9 @@ def render_sidebar() -> dict:
         st.sidebar.caption(
             "Sub-categories are discovered automatically via the API and turned into separate scrape tasks."
         )
+        st.sidebar.caption(
+            "Product names follow your category URL language: `/zh/` → Chinese, `/en/` → English."
+        )
 
     sort_label = st.sidebar.selectbox(
         "Sort results by",
@@ -1938,7 +1970,7 @@ def render_sidebar() -> dict:
         help="Leave at 0 to scrape everything. Unlimited runs may take a long time.",
     )
 
-    return {
+    cfg = {
         "method": method,
         "keywords": keywords,
         "category_urls": category_urls,
@@ -1954,9 +1986,10 @@ def render_sidebar() -> dict:
         "use_pdp_fallback": False,
         "include_images": True,
         "embed_images_in_excel": True,
-        "website_key": "hktv_en",
         "sort_by": API_SORT_OPTIONS[sort_label],
     }
+    cfg["website_key"] = resolve_website_key(cfg)
+    return cfg
 
 
 def render_activity_log() -> None:
@@ -2128,6 +2161,7 @@ def render_main() -> None:
             )
         elif st.button("Start", use_container_width=True, type="primary"):
             st.session_state.settings = deepcopy(cfg)
+            st.session_state.website_key = cfg.get("website_key", "hktv_zh")
             if not st.session_state.tasks:
                 st.session_state.tasks = build_tasks(cfg, session=get_session())
                 append_activity(f"Prepared {len(st.session_state.tasks)} task(s)", "info")
@@ -2176,7 +2210,7 @@ def render_main() -> None:
             st.session_state.stats = data.get("stats", st.session_state.stats)
             st.session_state.settings = data.get("settings", st.session_state.settings)
             st.session_state.activity_log = data.get("activity_log", [])
-            st.session_state.website_key = data.get("website_key", "hktv_en")
+            st.session_state.website_key = data.get("website_key", "hktv_zh")
             append_activity("Checkpoint restored", "info")
             st.success("Checkpoint restored.")
         except Exception as exc:

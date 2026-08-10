@@ -116,12 +116,27 @@ def test_auto_breakdown_tasks() -> None:
     check("code tasks are scrapeable", all(t.get("categories") for t in code_tasks[:10]))
 
 
+def test_locale_from_category_url() -> None:
+    print("\n[5] Product language from category URL")
+    cfg = {
+        "category_urls": ["https://www.hktvmall.com/hktv/zh/mothernbaby"],
+        "category_codes": [],
+    }
+    check("zh URL → hktv_zh", scraper.resolve_website_key(cfg) == "hktv_zh")
+    cfg_en = {
+        "category_urls": ["https://www.hktvmall.com/hktv/en/mothernbaby"],
+        "category_codes": [],
+    }
+    check("en URL → hktv_en", scraper.resolve_website_key(cfg_en) == "hktv_en")
+
+
 def main() -> int:
     print("=== Category URL/Code Breakdown Tests ===")
     test_url_slug_extraction()
     test_aa_code_extraction()
     test_api_fetch_roots()
     test_auto_breakdown_tasks()
+    test_locale_from_category_url()
     print(f"\n=== Results: {PASS} passed, {FAIL} failed ===")
     scraper.close_session()
     return 0 if FAIL == 0 else 1
