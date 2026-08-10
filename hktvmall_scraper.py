@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.0-category-breakdown"
+APP_VERSION = "1.6.1-ui-controls"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -61,7 +61,7 @@ CHECKPOINT_DIR = "hktv_checkpoints"
 BACKUP_DIR = "hktv_backups"
 EXPORT_DIR = "hktv_exports"
 IMAGE_CACHE_DIR = "hktv_image_cache"
-PREVIEW_PAGE_SIZE_OPTIONS = (100, 500, 1000, 5000, 0)  # 0 = show all rows
+PREVIEW_RECORD_CHECK_LIMIT = 100  # Oldest scraped rows shown in UI (record check only)
 
 WEBSITES: dict[str, dict[str, str]] = {
     "hktv_zh": {
@@ -1998,63 +1998,55 @@ def render_task_queue() -> None:
         st.dataframe(task_df, use_container_width=True, height=280)
 
 
+def render_running_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        @keyframes hktv-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+        .hktv-running-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+            color: #ff4b4b;
+            margin-top: 0.25rem;
+        }
+        .hktv-running-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #ff4b4b;
+            animation: hktv-pulse 1s ease-in-out infinite;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_preview(cfg: dict) -> None:
     rows = st.session_state.rows
     if not rows:
-        st.info("No data yet. Click **Prepare tasks**, then **Start**.")
+        st.info("No data yet. Click **Start** to begin scraping.")
         return
 
-    sort_key = st.selectbox(
-        "Preview sort",
-        options=list(SORT_OPTIONS.keys()),
-        index=list(SORT_OPTIONS.keys()).index(
-            st.session_state.get("preview_sort", "Default (scrape order)")
-        ),
-        key="preview_sort_select",
-    )
-    st.session_state.preview_sort = sort_key
-    full_df = sort_dataframe(rows_to_dataframe(rows), sort_key)
-    export_df = full_df[EXCEL_COLUMNS]
-    total = len(export_df)
+    total = len(rows)
+    preview_rows = rows[:PREVIEW_RECORD_CHECK_LIMIT]
+    preview_df = rows_to_dataframe(preview_rows)[EXCEL_COLUMNS]
 
-    page_size = st.selectbox(
-        "Rows per preview page (0 = show all)",
-        options=list(PREVIEW_PAGE_SIZE_OPTIONS),
-        index=1,
-        format_func=lambda n: "All" if n == 0 else str(n),
-        key="preview_page_size_select",
+    st.subheader("Record check preview")
+    st.caption(
+        f"Showing the **oldest {len(preview_df):,}** scraped record(s) only (fixed snapshot for "
+        f"quick verification). This preview does **not** follow the latest rows during a run — "
+        f"it is intentionally lightweight to save CPU and power. "
+        f"**{total:,}** products collected in total; downloads include **all** rows."
     )
-    page_count = 1 if page_size == 0 else max(1, (total + page_size - 1) // page_size)
-    page_no = (
-        st.number_input(
-            "Preview page",
-            min_value=1,
-            max_value=page_count,
-            value=1,
-            step=1,
-            key="preview_page_no",
-        )
-        if page_size > 0
-        else 1
-    )
-
-    if page_size > 0:
-        start = (page_no - 1) * page_size
-        view_df = export_df.iloc[start : start + page_size]
-        st.subheader("Data preview")
-        st.caption(
-            f"{total:,} products total — showing rows {start + 1:,}–{min(start + page_size, total):,}. "
-            f"Downloads include all {total:,} rows."
-        )
-    else:
-        view_df = export_df
-        st.subheader("Data preview")
-        st.caption(f"Showing all {total:,} products. Downloads include the same data.")
 
     st.dataframe(
-        view_df,
+        preview_df,
         use_container_width=True,
-        height=min(700, max(300, 35 * min(len(view_df) + 1, 25))),
+        height=min(420, max(220, 32 * min(len(preview_df) + 1, 12))),
         column_config={
             "Product Image": st.column_config.ImageColumn("Product Image", width="small"),
             "Product URL": st.column_config.LinkColumn("Product URL", display_text="Open"),
@@ -2066,49 +2058,57 @@ def render_preview(cfg: dict) -> None:
         },
     )
 
+    if st.session_state.auto_run:
+        st.caption("⏸ Pause scraping to generate download files (skipped while running to save resources).")
+        return
+
+    full_df = rows_to_dataframe(rows)
+    export_df = full_df[EXCEL_COLUMNS]
     session = get_session()
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.download_button(
-            f"Download CSV ({total:,} rows)",
-            data=export_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with c2:
-        st.download_button(
-            f"Download Excel ({total:,} rows)",
-            data=build_excel_with_images(
-                full_df,
+    with st.expander(f"Download exports ({total:,} rows)", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                f"Download CSV ({total:,} rows)",
+                data=export_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with c2:
+            st.download_button(
+                f"Download Excel ({total:,} rows)",
+                data=build_excel_with_images(
+                    full_df,
+                    session,
+                    embed_images=cfg.get("embed_images_in_excel", True),
+                    timeout=cfg.get("timeout", 30),
+                    source_rows=rows,
+                ),
+                file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with c3:
+            zip_bytes, zip_name = build_export_package(
+                st.session_state.rows,
                 session,
-                embed_images=cfg.get("embed_images_in_excel", True),
+                include_images=cfg.get("include_images", True),
+                embed_images_in_excel=cfg.get("embed_images_in_excel", True),
                 timeout=cfg.get("timeout", 30),
-                source_rows=rows,
-            ),
-            file_name=f"hktv_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with c3:
-        zip_bytes, zip_name = build_export_package(
-            st.session_state.rows,
-            session,
-            include_images=cfg.get("include_images", True),
-            embed_images_in_excel=cfg.get("embed_images_in_excel", True),
-            timeout=cfg.get("timeout", 30),
-        )
-        st.download_button(
-            f"Download ZIP ({total:,} rows + images)",
-            data=zip_bytes,
-            file_name=zip_name,
-            mime="application/zip",
-            use_container_width=True,
-        )
+            )
+            st.download_button(
+                f"Download ZIP ({total:,} rows + images)",
+                data=zip_bytes,
+                file_name=zip_name,
+                mime="application/zip",
+                use_container_width=True,
+            )
 
 
 def render_main() -> None:
     init_state()
+    render_running_styles()
     cfg = render_sidebar()
 
     st.title("HKTVmall Product Scraper")
@@ -2117,27 +2117,35 @@ def render_main() -> None:
         "checkpoints, deduplication, and clean Excel export."
     )
 
-    b1, b2, b3, b4, b5 = st.columns(5)
+    is_running = bool(st.session_state.auto_run)
+    b1, b2, b3, b4 = st.columns(4)
     with b1:
-        if st.button("Prepare tasks", use_container_width=True):
-            reset_run_state(keep_settings=True)
-            st.session_state.settings = deepcopy(cfg)
-            st.session_state.tasks = build_tasks(cfg, session=get_session())
-            append_activity(f"Prepared {len(st.session_state.tasks)} task(s)", "info")
-            st.success(f"Prepared {len(st.session_state.tasks)} task(s)")
-    with b2:
-        if st.button("Start", use_container_width=True, type="primary"):
+        if is_running:
+            st.button("Running…", use_container_width=True, type="primary", disabled=True)
+            st.markdown(
+                '<div class="hktv-running-label"><span class="hktv-running-dot"></span>Scraping</div>',
+                unsafe_allow_html=True,
+            )
+        elif st.button("Start", use_container_width=True, type="primary"):
             st.session_state.settings = deepcopy(cfg)
             if not st.session_state.tasks:
                 st.session_state.tasks = build_tasks(cfg, session=get_session())
+                append_activity(f"Prepared {len(st.session_state.tasks)} task(s)", "info")
             st.session_state.auto_run = True
             st.session_state.running = True
             append_activity("Scraping started", "info")
-    with b3:
-        if st.button("Pause", use_container_width=True):
+            st.rerun()
+    with b2:
+        if st.button("Pause", use_container_width=True, disabled=not is_running):
             st.session_state.auto_run = False
             st.session_state.running = False
             append_activity("Scraping paused", "warning")
+            st.rerun()
+    with b3:
+        if st.button("Reset", use_container_width=True):
+            reset_run_state(keep_settings=False)
+            st.warning("Run state cleared")
+            st.rerun()
     with b4:
         if st.button("Save checkpoint", use_container_width=True):
             path = save_checkpoint(
@@ -2155,10 +2163,6 @@ def render_main() -> None:
             )
             append_activity(f"Checkpoint saved: {path}", "info")
             st.success(f"Checkpoint saved: {path}")
-    with b5:
-        if st.button("Reset", use_container_width=True):
-            reset_run_state(keep_settings=False)
-            st.warning("Run state cleared")
 
     uploaded = st.file_uploader("Restore checkpoint JSON", type=["json"])
     if uploaded is not None:
