@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.5-aa-category-scope"
+APP_VERSION = "1.6.6-handoff"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -1844,6 +1844,8 @@ def run_one_step(cfg: dict) -> dict[str, Any]:
         st.session_state.seen_product_ids.add(product_id)
         added += 1
         task["products_collected"] = int(task.get("products_collected") or 0) + 1
+        if product_limit > 0 and len(st.session_state.rows) >= product_limit:
+            break
 
     st.session_state.stats["products_added"] += added
 
