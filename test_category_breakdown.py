@@ -112,7 +112,7 @@ def test_auto_breakdown_tasks() -> None:
         "timeout": 30,
     }
     code_tasks = scraper.build_tasks(code_cfg, session=session)
-    check("2 AA roots produce tasks", len(code_tasks) > len(CATEGORY_CODES), f"{len(code_tasks)} tasks")
+    check("2 AA roots produce one task each", len(code_tasks) == len(CATEGORY_CODES), f"{len(code_tasks)} tasks")
     check("code tasks are scrapeable", all(t.get("categories") for t in code_tasks[:10]))
 
 
@@ -130,6 +130,31 @@ def test_locale_from_category_url() -> None:
     check("en URL → hktv_en", scraper.resolve_website_key(cfg_en) == "hktv_en")
 
 
+def test_aa_code_single_task_scope() -> None:
+    print("\n[6] AA category code stays scoped (no over-breakdown)")
+    session = scraper.build_session()
+    cfg = {
+        "method": "category",
+        "category_urls": [],
+        "category_codes": ["AA28570000000"],
+        "auto_breakdown_categories": True,
+        "timeout": 30,
+    }
+    tasks = scraper.build_tasks(cfg, session=session)
+    check("AA code creates one scoped task", len(tasks) == 1, f"{len(tasks)} tasks")
+    if tasks:
+        check(
+            "task uses exact AA code",
+            tasks[0].get("categories") == ["AA28570000000"],
+            str(tasks[0].get("categories")),
+        )
+    result = scraper.hktv_fetch_page(
+        session, categories=["AA28570000000"], page_number=0, page_size=1, timeout=30,
+    )
+    api_total = int(result.get("total") or 0)
+    check("API total near 15k for AA28570000000", 14000 <= api_total <= 16000, f"total={api_total}")
+
+
 def main() -> int:
     print("=== Category URL/Code Breakdown Tests ===")
     test_url_slug_extraction()
@@ -137,6 +162,7 @@ def main() -> int:
     test_api_fetch_roots()
     test_auto_breakdown_tasks()
     test_locale_from_category_url()
+    test_aa_code_single_task_scope()
     print(f"\n=== Results: {PASS} passed, {FAIL} failed ===")
     scraper.close_session()
     return 0 if FAIL == 0 else 1

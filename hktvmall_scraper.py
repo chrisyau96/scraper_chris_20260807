@@ -36,7 +36,7 @@ from urllib3.util.retry import Retry
 # 常數
 # =============================================================================
 
-APP_VERSION = "1.6.4-download-fix"
+APP_VERSION = "1.6.5-aa-category-scope"
 HKTV_SEARCH_URL = "https://keyword-search-server.hktvmall.com/api/search"
 HKTV_API_KEY = "0e6c95ec-4c8b-4f71-8855-11eeafe74966"
 HKTV_INDEX_NAME = "hktvProduct"
@@ -328,6 +328,26 @@ def extract_aa_category_code(raw: str) -> str:
 def extract_category_code_from_input(raw: str) -> str:
     """Backward-compatible helper: prefer AA code, else slug from URL."""
     return extract_aa_category_code(raw) or extract_category_slug_from_url(raw)
+
+
+def is_aa_category_code(code: str) -> bool:
+    return bool(re.fullmatch(r"AA\d{11,}", clean(code), flags=re.I))
+
+
+def should_auto_breakdown_root(root: str) -> bool:
+    """Only auto-split slug browse categories (pets, mothernbaby). AA codes stay scoped."""
+    return not is_aa_category_code(root)
+
+
+def is_descendant_aa_category(child: str, parent: str) -> bool:
+    """True when child AA code belongs under the parent AA hierarchy."""
+    if not is_aa_category_code(parent):
+        return True
+    child_code = clean(child).upper()
+    parent_code = clean(parent).upper()
+    if not child_code or child_code == parent_code or not is_aa_category_code(child_code):
+        return False
+    return child_code.startswith(parent_code[:6])
 
 
 def resolve_category_roots(cfg: dict) -> list[str]:
@@ -865,15 +885,20 @@ def discover_child_category_codes(
         timeout=timeout,
     )
     agg = result.get("aggregations", {}).get("primaryCatCode") or {}
+    parent_total = int(result.get("total") or 0)
     if isinstance(agg, dict) and agg:
         children = [
             {"code": clean(code), "name": clean(code), "count": int(count)}
             for code, count in agg.items()
-            if clean(code) and clean(code) != parent_code
+            if clean(code)
+            and clean(code) != parent_code
+            and is_descendant_aa_category(clean(code), parent_code)
         ]
         if children:
             children.sort(key=lambda item: (-item.get("count", 0), item["code"]))
             return [{"code": item["code"], "name": item["name"]} for item in children]
+        if is_aa_category_code(parent_code) and parent_total > 0:
+            return []
 
     discovered: dict[str, str] = {}
 
@@ -881,7 +906,7 @@ def discover_child_category_codes(
         for hit in hits:
             src = hit.get("source") or hit
             code = clean(src.get("primaryCatCode"))
-            if not code or code == parent_code:
+            if not code or code == parent_code or not is_descendant_aa_category(code, parent_code):
                 continue
             cat_display = src.get("categoryStructureDisplay")
             if isinstance(cat_display, list) and cat_display:
@@ -1485,7 +1510,7 @@ def build_category_breakdown_tasks(
     """Turn category roots into leaf scrape tasks by auto-discovering sub-categories."""
     tasks: list[dict] = []
     for root in roots:
-        if auto_breakdown:
+        if auto_breakdown and should_auto_breakdown_root(root):
             children = discover_child_category_codes(session, root, timeout=timeout)
             if children:
                 for child in children:
@@ -1947,7 +1972,11 @@ def render_sidebar() -> dict:
         category_codes = [scalar_text(x) for x in raw_codes.splitlines() if scalar_text(x)]
 
         st.sidebar.caption(
-            "Sub-categories are discovered automatically via the API and turned into separate scrape tasks."
+            "Slug URLs (pets, mothernbaby) auto-split into sub-categories. "
+            "AA codes scrape that exact category only (~15k stays ~15k)."
+        )
+        st.sidebar.caption(
+            "Both URL and code fields are used if both are filled — clear the field you do not need."
         )
         st.sidebar.caption(
             "Product names follow your category URL language: `/zh/` → Chinese, `/en/` → English."
